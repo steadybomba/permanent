@@ -1,0 +1,9 @@
+# Optional extras for advanced TLS fingerprinting
+# Install with: pip install -r requirements-extras.txt
+# Optional scoring dependencies
+# Install with: pip install scikit-learn joblib
+scikit-learn
+joblib
+
+# TLS client support for advanced fingerprinting
+tls-client

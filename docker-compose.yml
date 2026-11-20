@@ -1,0 +1,30 @@
+services:
+  evul:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      REQUIRE_AUTH: "true"
+      FLASK_DEBUG: "0"
+      PORT: "5000"
+      # Explicitly pin the volume-backed paths (mirrors Dockerfile ENV,
+      # but making them explicit here means a Dockerfile change can't
+      # silently move your data out of the mount).
+      PROJECT_DB_PATH: /app/data/project_data.db
+      HARVESTER_STATE_FILE: /app/data/harvester_state.json
+      BUILDER_DATA_PATH: /app/data/builder_data
+      DRS_OUT_PATH: /app/drs_out
+      LOG_DIR: /app/logs
+    volumes:
+      - ./data:/app/data
+      - ./drs_out:/app/drs_out
+      - ./logs:/app/logs
+      - ./configs:/app/configs
+      - ./email_templates:/app/email_templates
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
